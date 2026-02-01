@@ -1024,9 +1024,15 @@ void StreamDiffusion::operator()()
             outputs.image.texture.bytes, model_tex_w, model_tex_h);
         if(inputs.feed_prev_in > 0)
         {
+#if QT_VERSION > QT_VERSION_CHECK(6, 6, 0)
           m_prev_input.storage.assign(
               (const char*)input_tex_bytes,
               (const char*)input_tex_bytes + m_cur_input.sizeInBytes());
+#else
+          m_prev_input.storage.clear();
+          m_prev_input.storage.insert(
+              0, (const char*)input_tex_bytes, m_cur_input.sizeInBytes());
+#endif
           m_prev_input.image = QImage(
               (unsigned char*)m_prev_input.storage.data(), model_tex_w, model_tex_h,
               QImage::Format_RGBA8888);
@@ -1034,9 +1040,15 @@ void StreamDiffusion::operator()()
 
         if(inputs.feed_prev_out > 0)
         {
+#if QT_VERSION > QT_VERSION_CHECK(6, 6, 0)
           m_prev_output.storage.assign(
               (const char*)outputs.image.texture.bytes,
               (const char*)outputs.image.texture.bytes + m_cur_input.sizeInBytes());
+#else
+          m_prev_output.storage.clear();
+          m_prev_output.storage.insert(
+              0, (const char*)outputs.image.texture.bytes, m_cur_input.sizeInBytes());
+#endif
           m_prev_output.image = QImage(
               (unsigned char*)m_prev_output.storage.data(), model_tex_w, model_tex_h,
               QImage::Format_RGBA8888);
