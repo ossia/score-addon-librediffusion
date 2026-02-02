@@ -203,7 +203,7 @@ public:
       };
     } cfg;
 
-    struct : halp::toggle<"Add noise">
+    struct : halp::toggle<"Add noise", halp::toggle_setup{.init = true}>
     {
     } add_noise;
     struct : halp::toggle<"Denoising batch">
