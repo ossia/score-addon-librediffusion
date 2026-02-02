@@ -130,9 +130,14 @@ static std::vector<int> get_steps(std::string s)
     }
   }
 
-  return std::ranges::to<std::vector<int>>(
-      all_numbers(s)
-      | std::views::transform([](auto&& match) { return std::clamp(match.to_number(10), 0, 49); }));
+  auto view = all_numbers(s) | std::views::transform([](auto&& match) {
+    return std::clamp(match.to_number(10), 0, 49);
+  });
+
+  std::vector<int> result;
+  result.reserve(4);
+  std::ranges::copy(view, std::back_inserter(result));
+  return result;
 }
 
 SDConfig::SDConfig()
