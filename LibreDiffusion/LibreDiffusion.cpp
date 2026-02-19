@@ -8,7 +8,10 @@
 #include "schedulers/lcm_dreamshaper_v7.hpp"
 #include "schedulers/sd-turbo.hpp"
 #include "schedulers/sdxl-turbo.hpp"
+
 #include <ossia/detail/fmt.hpp>
+#include <ossia/detail/small_vector.hpp>
+
 #include <ctre.hpp>
 #include <boost/fusion/include/adapt_struct.hpp>
 #include <boost/spirit/home/x3.hpp>
