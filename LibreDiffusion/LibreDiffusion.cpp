@@ -784,6 +784,19 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
   m_sd.config_set_denoising_batch(config.get(), m_config_state.use_denoising_batch ? 1 : 0);
   m_sd.config_set_cfg_type(
       config.get(), static_cast<librediffusion_cfg_type_t>(m_config_state.cfg_type));
+
+  // CUDA graph: enable for 1-step workflows (SD-Turbo / SDXS / 1-step Hyper + their ControlNet/IP-Adapter
+  // variants). Capturable only for denoising_steps==1, cfg-none, non-V2V (the .so re-gates identically and
+  // falls back to per-call enqueue otherwise). Measured ~+16% end-to-end, output bit-identical. See
+  // CUDA_GRAPH_INTEGRATION_PLAN.md.
+  {
+    const bool one_step_graphable
+        = m_config_state.denoising_steps == 1
+          && m_config_state.cfg_type == SD_CFG_NONE
+          && pipeline_mode != MODE_TEMPORAL_V2V;
+    m_sd.config_set_cuda_graph(config.get(), one_step_graphable ? 1 : 0);
+  }
+
   m_sd.config_set_text_config(
       config.get(), m_config_state.text_seq_len, m_config_state.text_hidden_dim,
       m_config_state.clip_pad_token);
