@@ -36,3 +36,10 @@ Makefile
 *.user.*
 .cmake
 .vscode
+
+# agent session dir + scratch planning notes (not version-controlled)
+.claude/
+FLUX_KLEIN_IMPLEMENTATION_PLAN.md
+FLUX_KNOWLEDGE.md
+KLEIN_ASYNC_DESIGN.md
+LIBREDIFFUSION_ASYNC_ARCHITECTURE.md
