@@ -1,64 +1,41 @@
-cmake_minimum_required(VERSION 3.13 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
 
-if(NOT TARGET score_lib_base)
-  include("${SCORE_SOURCE_DIR}/cmake/ScoreExternalAddon.cmake")
-endif()
+project(score_addon_librediffusion LANGUAGES CXX)
 
-if(NOT TARGET score_plugin_avnd)
-  return()
-endif()
-
-# Addon requires CUDA Toolkit
+# Addon requires CUDA Toolkit; only Windows / Linux.
 if((NOT WIN32) AND (NOT LINUX))
   return()
 endif()
 
-project(score_addon_librediffusion LANGUAGES CXX)
-
-score_common_setup()
-
-avnd_score_plugin_init(
-  BASE_TARGET score_addon_librediffusion
-)
-
-if(0)
-avnd_score_plugin_add(
-  BASE_TARGET score_addon_librediffusion
-  SOURCES
-    LibreDiffusion/VAEEncoder.hpp
-    LibreDiffusion/VAEEncoder.cpp
-  TARGET librediffusion_vae_encoder
-  MAIN_CLASS VAEEncoder
-  NAMESPACE lo
-)
-avnd_score_plugin_add(
-  BASE_TARGET score_addon_librediffusion
-  SOURCES
-    LibreDiffusion/VAEEncoder.hpp
-    LibreDiffusion/VAEEncoder.cpp
-  TARGET librediffusion_vae_decoder 
-  MAIN_CLASS VAEDecoder
-  NAMESPACE lo
-)
+# Use the Avendish the host (ossia score) provides; otherwise fetch it.
+find_package(Avendish QUIET)
+if(NOT Avendish_FOUND)
+  include(FetchContent)
+  FetchContent_Declare(
+    Avendish
+    GIT_REPOSITORY "https://github.com/celtera/avendish"
+    GIT_TAG main)
+  FetchContent_Populate(Avendish)
+  list(APPEND CMAKE_PREFIX_PATH "${avendish_SOURCE_DIR}")
+  find_package(Avendish REQUIRED)
 endif()
 
-avnd_score_plugin_add(
-  BASE_TARGET score_addon_librediffusion
+if(COMMAND score_common_setup)
+  score_common_setup()
+endif()
+
+add_library(librediffusion_deps INTERFACE)
+target_include_directories(librediffusion_deps INTERFACE 3rdparty/librediffusion/src)
+
+avnd_addon_init(NAME score_addon_librediffusion)
+
+avnd_addon_object(
+  BASE score_addon_librediffusion C_NAME streamdiffusion CLASS StreamDiffusion NAMESPACE lo
+  DEPENDENCIES librediffusion_deps
   SOURCES
     LibreDiffusion/LibreDiffusion.hpp
     LibreDiffusion/LibreDiffusion.cpp
     LibreDiffusion/EngineCache.hpp
-    LibreDiffusion/EngineCache.cpp
-  TARGET streamdiffusion
-  MAIN_CLASS StreamDiffusion
-  NAMESPACE lo
-)
+    LibreDiffusion/EngineCache.cpp)
 
-
-target_include_directories(score_addon_librediffusion PRIVATE 3rdparty/librediffusion/src)
-avnd_score_plugin_finalize(
-  BASE_TARGET score_addon_librediffusion
-  PLUGIN_VERSION 1
-  PLUGIN_UUID "b3fe4d80-0a1a-4b23-8cd2-b82472f9f91f"
-)
-
+avnd_addon_finalize(NAME score_addon_librediffusion UUID b3fe4d80-0a1a-4b23-8cd2-b82472f9f91f VERSION 1)
