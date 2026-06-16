@@ -1,4 +1,5 @@
 #pragma once
+#include "AsyncFrameProducer.hpp"
 #include "librediffusion_loader.hpp"
 
 #include <ossia/detail/lockfree_queue.hpp>
@@ -341,13 +342,16 @@ public:
       halp_meta(description, "RIFE optical-flow interpolation: 0=off, 1=2x, 2=4x, 3=8x (klein output)")
     } rife_exp;
 
-    // FLUX.2-klein only: run diffusion on a worker thread (async) so the render thread
-    // emits a smooth interpolated frame every tick instead of stalling ~200ms on diffusion.
+    // Run diffusion on a worker thread (async) so the render thread emits a smooth, steady-clock-paced
+    // frame every tick instead of stalling on diffusion. FLUX.2-klein and plain SD/SD-turbo/SDXS/SDXL
+    // txt2img/img2img (the slow ones — e.g. SDXL @1024 ~10fps — benefit most); ControlNet/IP-Adapter
+    // stay synchronous for now (per-tick conditioning).
     struct : halp::toggle<"Async">
     {
-      halp_meta(description, "FLUX.2-klein: diffuse on a worker thread; render thread interpolates "
-                             "continuously between the two latest real frames (fluid). Off = "
-                             "synchronous (diffuse on the render thread).")
+      halp_meta(description, "Diffuse on a worker thread; the render thread presents steady-clock-paced "
+                             "frames and (with RIFE) interpolates between the latest real frames. Off = "
+                             "synchronous (diffuse on the render thread). Applies to klein and plain "
+                             "SD/SDXL txt2img/img2img; CN/IP stay synchronous.")
     } klein_async;
 
     // FLUX.2-klein async only: how the render thread plays the producer's sweeps (latency vs continuity).
@@ -365,32 +369,8 @@ public:
     halp::texture_output<"Out"> image;
   } outputs;
 
-  // ---- Phase C async klein producer/consumer types --------------------------------------------
-  // A finished SWEEP published by the producer thread into the triple_buffer: the diffused keyframe
-  // (cur) PLUS the 2^exp RIFE sub-frames interpolating prev->cur (display order, last == cur).
-  // RIFE now runs ON THE PRODUCER THREAD (next to diffusion), so the render thread does NO GPU compute
-  // (no RIFE, no diffusion) — it only picks one sub-frame by phase and uploads it. This removes the
-  // render-vs-diffusion GPU contention that was starving production.
-  struct KleinRealFrame
-  {
-    std::vector<unsigned char> rgba;  // the keyframe (cur). Also == sweep tail when sweep present.
-    std::vector<unsigned char> sweep; // 2^exp sub-frames prev->cur concatenated (empty if no prev/no interp)
-    int sweep_n{0};                   // number of sub-frames in `sweep` (0 -> present `rgba`)
-    int w{0}, h{0};
-    uint64_t gen{0};   // generation id; render drops frames from a stale config
-  };
-
-  // The diffusion job handed render->producer (latest-wins). Carries everything the producer loop
-  // needs. The producer thread is the ONLY caller of the flux2 C-API (TRT contexts are single-thread).
-  struct KleinJob
-  {
-    std::vector<unsigned char> ref_rgba;  // reference frame (img2img) or black (txt2img)
-    bool ref_changed{false};              // whether to re-run set_reference (VAE encode)
-    int w{0}, h{0};
-    int exp{0};                           // RIFE interpolation exp (producer renders the sweep)
-    uint64_t gen{0};
-    bool valid{false};
-  };
+  // Async producer/consumer payloads (AsyncFrame keyframe+sweep, AsyncJob ref+exp) are the shared
+  // types in AsyncFrameProducer.hpp — used identically by the klein and SD/SDXL async paths.
 
   StreamDiffusion() noexcept;
   ~StreamDiffusion();
@@ -418,8 +398,6 @@ private:
   // FLUX.2-klein streaming path (self-contained, bypasses the SD pipeline machinery)
   void runKlein(const inputs_t& in_config);
   bool createKleinStream(const inputs_t& in_config);
-  void emitWithRife(
-      const unsigned char* frame_rgba, int w, int h);
 
   SDFluxStream m_klein_stream;
   SDRife m_rife;
@@ -439,56 +417,56 @@ private:
   std::deque<std::vector<unsigned char>> m_klein_queue;
   int m_klein_last_exp{-1};
 
-  // ---- Phase C: steady-clock paced async (dedicated producer thread + triple_buffer) ----------
-  // The render thread (operator()) emits ONE frame per tick on a STEADY wall-clock phase, fully
-  // decoupled from when diffusion keyframes arrive. A dedicated node-owned producer thread runs the
-  // (~150ms) diffusion on the klein stream's own low-prio CUDA stream and hands finished keyframes
-  // back through a lock-free triple_buffer (no Qt-main-thread hop). The render thread keeps the two
-  // latest keyframes, precomputes the RIFE sweep ONCE per adopted keyframe, and per-tick just memcpy's
-  // the phase-indexed cached sub-frame -> constant tiny per-tick cost -> tight pacing.
+  // ---- Async (Phase C): steady-clock paced producer/consumer, SHARED between klein and SD/SDXL. -----
+  // A node-owned producer thread runs the heavy diffusion (+RIFE) on the model's own CUDA stream and
+  // publishes finished keyframe+sweep frames through a lock-free triple_buffer; the render thread
+  // (runKleinAsync / runSDAsync -> presentAsync) presents ONE credit-paced sub-frame per tick, fully
+  // decoupled. Both paths use the same AsyncFrameProducer + PacedFrameConsumer (see AsyncFrameProducer.hpp).
+
+  // Shared render-side driver: submit a job when the reference/exp changes, consume the freshest
+  // keyframe into `consumer`, and present one paced frame to outputs.image. `ref_constant_hash` is true
+  // for txt2img (black ref hashes constant -> submitted once).
+  void presentAsync(
+      AsyncFrameProducer<AsyncJob, AsyncFrame>& producer, PacedFrameConsumer& consumer,
+      const unsigned char* ref, bool have_input, int exp, uint64_t gen, int pacing, int w, int h,
+      bool ref_constant_hash, uint64_t& ref_hash, bool& ref_set, int& last_exp, double& last_tick_t);
+
+  // --- FLUX.2-klein async (the producer body calls flux2_stream_set_reference + frame_cached + RIFE) ---
   void runKleinAsync(const inputs_t& in_config);
-  void startKleinProducer();
+  void ensureKleinProducer();
   void stopKleinProducer();
-  void kleinProducerLoop(std::stop_token stop);
 
-  std::jthread m_klein_producer;
-  // Both directions are lock-free triple_buffers (newest-wins). The cv/mutex below are ONLY a wakeup
-  // for the sleeping producer (a lock-free queue can't block a thread; you'd otherwise busy-spin a
-  // core) — they guard NO data. The render thread never holds the mutex on its hot path.
-  ossia::triple_buffer<KleinRealFrame> m_klein_real_tb;  // producer -> render (keyframes out)
-  ossia::triple_buffer<KleinJob> m_klein_job_tb;         // render -> producer (job in)
-  std::mutex m_klein_wake_mtx;            // companion for the cv only (no data)
-  std::condition_variable m_klein_job_cv; // wake the idle producer when a job is produced
-  std::atomic<bool> m_klein_job_ready{false};      // set by render after produce; lost-wakeup-safe predicate
-  std::atomic<bool> m_klein_producer_busy{false};  // a keyframe is being diffused right now
-
-  // ---- PRODUCER-thread-only state (the producer owns RIFE so the render thread does NO GPU compute) -
-  SDRife m_klein_producer_rife;            // RIFE handle used ONLY by the producer thread
-  std::vector<unsigned char> m_klein_prev_key;  // previous keyframe (producer-side, to interpolate from)
+  std::unique_ptr<AsyncFrameProducer<AsyncJob, AsyncFrame>> m_klein_producer;
+  PacedFrameConsumer m_klein_consumer;
+  SDRife m_klein_producer_rife;                 // RIFE handle owned by the klein producer thread
+  std::vector<unsigned char> m_klein_prev_key;  // previous keyframe (producer-side) to interpolate from
   bool m_klein_have_prev_key{false};
-  int m_klein_exp{0};                      // render-side: last exp submitted to the producer (change detect)
-  std::string m_klein_rife_path;           // rife engine path (for lazy producer-side create)
-
-  // ---- RENDER-thread-only state: SUB-FRAME FIFO drained at the MEASURED PRODUCTION RATE -------------
-  // Async is slightly less smooth than sync because content arrives at the diffusion rate (e.g. 7fps x
-  // 2^exp sub-frames) which rarely equals the display rate. Popping exactly 1/tick then HOLDING on empty
-  // bunches the repeats into visible stutters. Instead we drain via a fractional CREDIT accumulator:
-  // each tick credit += measured_prod_rate * dt; we pop floor(credit) frames (keep the fraction). When
-  // content < display -> some ticks pop 0 (repeat), spread EVENLY; when content > display (bigger GPU) ->
-  // some ticks pop 2+ (skip), spread EVENLY. Self-calibrating from the measured rate — no hardcoded fps.
-  std::deque<std::vector<unsigned char>> m_klein_frames;  // pending sub-frames, display order
-  std::vector<unsigned char> m_klein_last_emit;           // last frame shown (held when the FIFO drains)
-  bool m_klein_have_emit{false};
-  double m_klein_prod_rate{0.0};      // EMA of MEASURED sub-frames produced per second; 0 = not yet measured
-  double m_klein_drain_credit{0.0};   // fractional sub-frames owed this tick (carries the remainder)
-  double m_klein_kf_interval{0.0};    // EMA of the MEASURED keyframe interval [s]; 0 = not yet measured
-  double m_klein_last_kf_t{0.0};      // wall time the last sweep was adopted (for interval measurement)
-  double m_klein_last_tick_t{0.0};    // wall time of previous tick (for render dt)
-  uint64_t m_klein_gen{0};            // bumped on config change -> invalidates in-flight jobs
-  double m_klein_dbg_last_pub_t{0.0};   // FPS dump: wall time of previous producer publish
-  double m_klein_dbg_last_emit_t{0.0};  // FPS dump: wall time of previous receiver present
+  std::string m_klein_rife_path;                // rife engine path (lazy producer-side create)
   uint64_t m_klein_async_ref_hash{0};
   bool m_klein_async_ref_set{false};
+  int m_klein_async_exp{-1};                    // last exp submitted (change detect)
+  double m_klein_last_tick_t{0.0};              // wall time of previous async tick (render dt)
+  uint64_t m_klein_gen{0};                      // bumped on config change -> invalidates in-flight jobs
+
+  // --- Generic async for SD/SD-turbo/SDXS/SDXL (producer body calls txt2img/img2img + RIFE). Scoped to
+  // plain txt2img/img2img (no per-tick CN/IP conditioning). ---
+  void runSDAsync(const inputs_t& in_config, unsigned char* input_tex_bytes, int w, int h);
+  void ensureSDProducer();
+  void stopSDProducer();
+  static bool sdAsyncEligible(int8_t workflow) noexcept;
+
+  std::unique_ptr<AsyncFrameProducer<AsyncJob, AsyncFrame>> m_sd_producer;
+  PacedFrameConsumer m_sd_consumer;
+  SDRife m_sd_producer_rife;                    // RIFE handle owned by the SD producer thread
+  std::vector<unsigned char> m_sd_prev_key;     // previous keyframe (producer-side) to interpolate from
+  bool m_sd_have_prev_key{false};
+  bool m_sd_async_img2img{false};               // stable while the producer runs (workflow change rebuilds)
+  std::string m_sd_rife_path;                   // rife engine path (lazy producer-side create)
+  uint64_t m_sd_gen{0};                         // bumped on config change -> invalidates in-flight jobs
+  uint64_t m_sd_async_ref_hash{0};
+  bool m_sd_async_ref_set{false};
+  int m_sd_async_exp{-1};                       // last exp submitted (change detect)
+  double m_sd_last_tick_t{0.0};                 // wall time of previous async tick (render dt)
 
   struct Image
   {
