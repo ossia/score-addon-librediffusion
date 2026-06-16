@@ -463,8 +463,6 @@ void SDXLEmbeddings::reset()
 
 StreamDiffusion::StreamDiffusion() noexcept
     : m_sd{sd::liblibrediffusion::instance()}
-    , m_klein_real_tb{KleinRealFrame{}}  // triple_buffer's default ctor is constrained; init explicitly
-    , m_klein_job_tb{KleinJob{}}
 {
   m_prev_inputs.workflow.value = {};
   m_prev_inputs.add_noise.value = {};
@@ -487,6 +485,9 @@ StreamDiffusion::~StreamDiffusion()
   // Phase C: join the producer BEFORE anything it touches (m_klein_stream, RIFE) is destroyed, so no
   // context/stream is used after free.
   stopKleinProducer();
+  // Same for the generic SD/SDXL producer: its produce body touches m_cached_engine + m_sd_producer_rife
+  // + m_sd_prev_key, so join it before those (and the cached engine below) are destroyed.
+  stopSDProducer();
   if (m_cached_engine)
   {
     EngineCache::instance().release(m_cached_engine);
@@ -1178,20 +1179,13 @@ bool StreamDiffusion::createKleinStream(const inputs_t& in_config)
   m_klein_ref_set = false;
   m_klein_ref_hash = 0;
   m_klein_queue.clear();
-  // async (Phase C): bump generation (stale keyframes from the old gen are dropped) + reset the
-  // render-thread keyframe pair / cached sweep / wall-clock phase state. The producer is stopped
-  // above and (re)started lazily by runKleinAsync once async mode is requested.
+  // async (Phase C): bump generation (stale keyframes from the old gen are dropped) + reset the paced
+  // consumer (FIFO / measured rate / phase) and the producer-side prev-key. The producer is stopped
+  // above (stopKleinProducer also resets these) and (re)started lazily by runKleinAsync.
   ++m_klein_gen;
-  m_klein_frames.clear();             // render-thread: drop the pending sub-frame FIFO
-  m_klein_have_emit = false;
-  m_klein_prod_rate = 0.0;            // re-measure production rate after a config change
-  m_klein_drain_credit = 0.0;
+  m_klein_consumer.reset();
   m_klein_have_prev_key = false;     // producer-thread: forget the prev keyframe
-  m_klein_last_kf_t = 0.0;
-  m_klein_kf_interval = 0.0;          // re-measure cadence after a config change (no stale assumption)
   m_klein_last_tick_t = 0.0;
-  m_klein_dbg_last_pub_t = 0.0;       // FPS dump: reset deltas so the first reading isn't bogus
-  m_klein_dbg_last_emit_t = 0.0;
   m_klein_async_ref_set = false;
   m_klein_async_ref_hash = 0;
   // remember the RIFE engine path so the producer can lazily create its OWN RIFE handle (the producer
@@ -1205,180 +1199,144 @@ bool StreamDiffusion::createKleinStream(const inputs_t& in_config)
   return true;
 }
 
-void StreamDiffusion::emitWithRife(const unsigned char* frame_rgba, int w, int h)
+// ---- Shared render-side async driver (used by both klein and SD/SDXL) --------------------------
+// Submit a job to the producer when the reference or exp changes (newest-wins), consume the freshest
+// produced keyframe+sweep into `consumer`, and present ONE credit-paced frame to outputs.image. The
+// producer thread (inside AsyncFrameProducer) owns all GPU work; this only does host memcpy + pacing.
+void StreamDiffusion::presentAsync(
+    AsyncFrameProducer<AsyncJob, AsyncFrame>& producer, PacedFrameConsumer& consumer,
+    const unsigned char* ref, bool have_input, int exp, uint64_t gen, int pacing, int w, int h,
+    bool ref_constant_hash, uint64_t& ref_hash, bool& ref_set, int& last_exp, double& last_tick_t)
 {
-  const int exp = std::clamp((int)inputs.rife_exp.value, 0, 3);
+  const size_t nbytes = (size_t)w * h * 4;
 
-  // RIFE disabled / no engine / first frame -> emit the real frame directly.
-  if (exp <= 0 || !m_rife || !m_sd.rife_interpolate || !m_klein_have_prev)
+  // Per-tick wall dt drives the credit-based FIFO drain.
+  const double tnow = now_s_steady();
+  double dt = (last_tick_t > 0.0) ? (tnow - last_tick_t) : 0.0;
+  last_tick_t = tnow;
+  dt = std::clamp(dt, 0.0, 0.1);
+
+  // Submit a fresh job whenever the reference changes (newest-wins) or the interpolation exp changes.
+  if (have_input && ref)
   {
-    this->outputs.image.create(w, h);
-    std::memcpy(outputs.image.texture.bytes, frame_rgba, (size_t)w * h * 4);
-    outputs.image.texture.changed = true;
-    return;
+    const uint64_t rh = ref_constant_hash ? 0xC0FFEEull : rapidhash(ref, nbytes);
+    if (!ref_set || rh != ref_hash)
+    {
+      AsyncJob job;
+      job.ref_rgba.assign(ref, ref + nbytes);
+      job.ref_changed = true;
+      job.w = w; job.h = h; job.exp = exp; job.gen = gen; job.valid = true;
+      producer.submit(std::move(job));
+      ref_hash = rh;
+      ref_set = true;
+    }
+    else if (exp != last_exp)
+    {
+      AsyncJob job;
+      job.ref_rgba.assign(ref, ref + nbytes);
+      job.ref_changed = false;            // ref already cached
+      job.w = w; job.h = h; job.exp = exp; job.gen = gen; job.valid = true;
+      producer.submit(std::move(job));
+    }
+    last_exp = exp;
   }
 
-  // Interpolate prev_out -> frame_rgba into 2^exp frames; emit the last (== cur).
-  const int n_max = 1 << exp;
-  m_rife_scratch.assign((size_t)n_max * w * h * 4, 0);
-  int n = 0;
-  auto err = m_sd.rife_interpolate(
-      m_rife.get(), m_klein_prev_out.data(), frame_rgba, h, w, m_rife_scratch.data(), &n);
+  // Consume the freshest produced keyframe+sweep into the paced FIFO.
+  const int budget_sweeps = (pacing == StreamDiffusion::Smooth) ? 3
+                          : (pacing == StreamDiffusion::Fresh)  ? 2 : 1;
+  AsyncFrame fresh;
+  if (producer.consume(fresh))
+    consumer.on_keyframe(fresh, tnow, budget_sweeps, gen);
+
+  // Present one steady-clock-paced frame (or hold the last). Nothing yet -> producer warming up.
+  const unsigned char* out_ptr = nullptr;
+  size_t out_bytes = 0;
+  if (!consumer.present(dt, out_ptr, out_bytes))
+    return;
 
   this->outputs.image.create(w, h);
-  if (err == LIBREDIFFUSION_SUCCESS && n > 0)
-  {
-    // Emit the most recent interpolated frame (display order, last == cur).
-    const unsigned char* last = m_rife_scratch.data() + (size_t)(n - 1) * w * h * 4;
-    std::memcpy(outputs.image.texture.bytes, last, (size_t)w * h * 4);
-  }
-  else
-  {
-    std::memcpy(outputs.image.texture.bytes, frame_rgba, (size_t)w * h * 4);
-  }
+  std::memcpy(outputs.image.texture.bytes, out_ptr, std::min<size_t>(nbytes, out_bytes));
   outputs.image.texture.changed = true;
 }
 
-// ---- Phase C: dedicated producer thread -------------------------------------------------------
-// Owns the heavy diffusion. The ONLY thread that calls the flux2 C-API once async is on (the TRT
-// execution contexts are single-thread). Pulls the newest job (latest-wins), runs set_reference (VAE
-// encode) when the ref changed + the ~150ms 2-step denoise+decode on the klein stream's own low-prio
-// CUDA stream, and publishes the finished keyframe into the triple_buffer. Never touches Qt / the
-// render thread state, so it cannot hitch the render loop.
-void StreamDiffusion::kleinProducerLoop(std::stop_token stop)
+// ---- klein producer: the heavy flux2 diffusion (+RIFE) on the worker thread --------------------
+// The produce body is the ONLY caller of the flux2 C-API once started (TRT contexts are single-thread).
+// rerun_when_idle=true keeps it diffusing flat-out so the interpolating consumer always has fresh
+// keyframes; the main thread drains it (stopKleinProducer) before touching the klein contexts.
+void StreamDiffusion::ensureKleinProducer()
 {
-  KleinJob job;
-  bool have_job = false;   // the last job we ran; reused to self-rearm when no newer one has arrived
-  for (;;)
-  {
-    // Pull the freshest job if the render thread published one (lock-free, newest-wins). We do NOT block
-    // here if we already have a previous job to reuse — that lets the producer run diffusion FLAT-OUT
-    // (back-to-back keyframes) instead of stalling one render-tick (~16ms) waiting to be re-poked. The
-    // render thread only refreshes the reference/exp; reusing the last job between its updates is correct.
-    {
-      KleinJob nj;
-      if (m_klein_job_tb.consume(nj))   // newest-wins built in
-      {
-        job = std::move(nj);
-        have_job = true;
-        m_klein_job_ready.store(false, std::memory_order_release);
-      }
-    }
-    if (!have_job)
-    {
-      // Nothing ever submitted yet -> block until the render thread signals the first job (lost-wakeup-safe).
-      std::unique_lock<std::mutex> lk(m_klein_wake_mtx);
-      m_klein_job_cv.wait(lk, [&]{
-        return stop.stop_requested() || m_klein_job_ready.load(std::memory_order_acquire);
-      });
-      if (stop.stop_requested())
-        return;
-      m_klein_job_ready.store(false, std::memory_order_release);
-      continue;   // loop back to consume the job we were just signalled about
-    }
-    if (stop.stop_requested())
-      return;
-    if (!job.valid || !m_klein_stream || !m_sd.flux2_stream_frame_cached)
-    {
-      have_job = false;
-      continue;
-    }
-
-    m_klein_producer_busy.store(true, std::memory_order_release);
-    const int w = job.w, h = job.h; const size_t nb = (size_t)w * h * 4;
-
-    if (job.ref_changed && m_sd.flux2_stream_set_reference)
-    {
-      if (m_sd.flux2_stream_set_reference(m_klein_stream.get(), job.ref_rgba.data())
-          != LIBREDIFFUSION_SUCCESS)
-      {
-        m_klein_producer_busy.store(false, std::memory_order_release);
-        have_job = false;
-        continue;
-      }
-      job.ref_changed = false;  // ref now cached -> a self-rearm reuse skips the (costly) VAE encode
-    }
-
-    // 1. diffuse the keyframe (~150ms) — this thread has the GPU largely to itself now (the render
-    //    thread does NO GPU compute; it only uploads a finished sub-frame).
-    KleinRealFrame out;
-    out.w = w; out.h = h; out.gen = job.gen;
-    out.rgba.assign(nb, 0);
-    if (m_sd.flux2_stream_frame_cached(m_klein_stream.get(), out.rgba.data())
-        != LIBREDIFFUSION_SUCCESS)
-    {
-      m_klein_producer_busy.store(false, std::memory_order_release);
-      have_job = false;
-      continue;
-    }
-
-    // 2. RIFE the sweep ON THIS THREAD (lazily create the producer-side RIFE handle). Interpolate the
-    //    previous keyframe -> this one into 2^exp sub-frames (display order, last == cur). RIFE runs
-    //    here, sequentially after diffusion, so it never competes with diffusion on a parallel stream.
-    if (job.exp > 0 && m_klein_have_prev_key)
-    {
-      if (!m_klein_producer_rife && !m_klein_rife_path.empty())
-      {
-        m_klein_producer_rife = SDRife{m_klein_rife_path.c_str()};
-        // The handle defaults to enabled=false / exp=0 -> rife_interpolate would use eff_exp=0 and return
-        // a single frame (sweep_n=1, NO interpolation). Must arm it explicitly.
-        if (m_klein_producer_rife && m_sd.rife_set_enabled)
-          m_sd.rife_set_enabled(m_klein_producer_rife.get(), 1);
-      }
-      // Keep the handle's exp in sync with the job (the user can change rife_exp live).
-      if (m_klein_producer_rife && m_sd.rife_set_interpolation_exp)
-        m_sd.rife_set_interpolation_exp(m_klein_producer_rife.get(), job.exp);
-      if (m_klein_producer_rife && m_sd.rife_interpolate)
-      {
-        const int n_max = 1 << job.exp;
-        out.sweep.assign((size_t)n_max * nb, 0);
-        int n = 0;
-        if (m_sd.rife_interpolate(m_klein_producer_rife.get(), m_klein_prev_key.data(),
-                                  out.rgba.data(), h, w, out.sweep.data(), &n)
-                == LIBREDIFFUSION_SUCCESS && n > 0)
-          out.sweep_n = n;
-        else { out.sweep.clear(); out.sweep_n = 0; }
-      }
-    }
-
-    // 3. remember this keyframe as the next sweep's prev, then publish the sweep (lock-free).
-    m_klein_prev_key = out.rgba;  // copy before move
-    m_klein_have_prev_key = true;
-    {
-      // Live FPS dump: instantaneous PRODUCER (diffusion/keyframe) rate = 1 / time-since-last-publish.
-      const double t = now_s_steady();
-      const double pfps = (m_klein_dbg_last_pub_t > 0.0)
-          ? 1.0 / std::max(1e-6, t - m_klein_dbg_last_pub_t) : 0.0;
-      m_klein_dbg_last_pub_t = t;
-      qDebug().nospace() << "[klein-PRODUCER] " << pfps << " fps (keyframe)  sweep_n="
-                         << out.sweep_n << " exp=" << job.exp;
-    }
-    m_klein_real_tb.produce(std::move(out));
-    m_klein_producer_busy.store(false, std::memory_order_release);
-  }
-}
-
-void StreamDiffusion::startKleinProducer()
-{
-  if (m_klein_producer.joinable())
+  if (m_klein_producer && m_klein_producer->running())
     return;
-  m_klein_producer = std::jthread(
-      [this](std::stop_token st) { kleinProducerLoop(st); });
+  if (!m_klein_producer)
+  {
+    auto produce = [this](AsyncJob& job, AsyncFrame& out) -> bool {
+      if (!job.valid || !m_klein_stream || !m_sd.flux2_stream_frame_cached)
+        return false;
+      const int w = job.w, h = job.h;
+      const size_t nb = (size_t)w * h * 4;
+      out.w = w; out.h = h; out.gen = job.gen;
+      out.rgba.assign(nb, 0);
+
+      // 1. set_reference (VAE encode) only when the ref changed; clear the flag so self-rearm reruns skip it.
+      if (job.ref_changed && m_sd.flux2_stream_set_reference)
+      {
+        if (m_sd.flux2_stream_set_reference(m_klein_stream.get(), job.ref_rgba.data())
+            != LIBREDIFFUSION_SUCCESS)
+          return false;
+        job.ref_changed = false;
+      }
+
+      // 2. diffuse the keyframe (~150ms 2-step denoise+decode on the klein stream's low-prio stream).
+      if (m_sd.flux2_stream_frame_cached(m_klein_stream.get(), out.rgba.data())
+          != LIBREDIFFUSION_SUCCESS)
+        return false;
+
+      // 3. RIFE the sweep prev->cur on this thread (lazy handle create; sequential -> no stream contention).
+      if (job.exp > 0 && m_klein_have_prev_key)
+      {
+        if (!m_klein_producer_rife && !m_klein_rife_path.empty())
+        {
+          m_klein_producer_rife = SDRife{m_klein_rife_path.c_str()};
+          if (m_klein_producer_rife && m_sd.rife_set_enabled)
+            m_sd.rife_set_enabled(m_klein_producer_rife.get(), 1);
+        }
+        if (m_klein_producer_rife && m_sd.rife_set_interpolation_exp)
+          m_sd.rife_set_interpolation_exp(m_klein_producer_rife.get(), job.exp);
+        if (m_klein_producer_rife && m_sd.rife_interpolate && m_klein_prev_key.size() >= nb)
+        {
+          const int n_max = 1 << job.exp;
+          out.sweep.assign((size_t)n_max * nb, 0);
+          int n = 0;
+          if (m_sd.rife_interpolate(m_klein_producer_rife.get(), m_klein_prev_key.data(),
+                                    out.rgba.data(), h, w, out.sweep.data(), &n)
+                  == LIBREDIFFUSION_SUCCESS && n > 0)
+            out.sweep_n = n;
+          else { out.sweep.clear(); out.sweep_n = 0; }
+        }
+      }
+
+      // 4. remember this keyframe as the next sweep's prev (producer-thread-only state).
+      m_klein_prev_key = out.rgba;
+      m_klein_have_prev_key = true;
+      return true;
+    };
+    m_klein_producer = std::make_unique<AsyncFrameProducer<AsyncJob, AsyncFrame>>(
+        std::move(produce), /*rerun_when_idle=*/true);
+  }
+  m_klein_producer->start();
 }
 
 void StreamDiffusion::stopKleinProducer()
 {
-  if (!m_klein_producer.joinable())
-    return;
-  m_klein_producer.request_stop();
-  // wake the producer so it observes stop (cv predicate also checks stop_requested)
-  { std::lock_guard<std::mutex> lk(m_klein_wake_mtx); m_klein_job_ready.store(true, std::memory_order_release); }
-  m_klein_job_cv.notify_all();
-  m_klein_producer.join();
-  // drain any queued job so a restart starts clean
-  { KleinJob drop; while(m_klein_job_tb.consume(drop)) {} }
-  m_klein_job_ready.store(false, std::memory_order_release);
-  m_klein_producer_busy.store(false, std::memory_order_release);
+  if (m_klein_producer)
+    m_klein_producer->stop();
+  m_klein_consumer.reset();
+  m_klein_have_prev_key = false;
+  m_klein_prev_key.clear();
+  m_klein_async_ref_set = false;
+  m_klein_async_ref_hash = 0;
+  m_klein_async_exp = -1;
+  m_klein_last_tick_t = 0.0;
 }
 
 void StreamDiffusion::runKlein(const inputs_t& in_config)
@@ -1447,8 +1405,7 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
     // lazily in runKleinAsync). This JOIN blocks the GUI thread until the in-flight keyframe finishes
     // (~150ms) -> a freeze. Should fire ONLY when the prompt actually changes; if it logs every tick,
     // the prompt input is oscillating (the real bug).
-    if (m_klein_producer.joinable())
-      stopKleinProducer();
+    stopKleinProducer();              // drain+join (also resets the consumer + prev-key); restarts lazily
     if (m_sd.flux2_stream_set_prompt
         && m_sd.flux2_stream_set_prompt(
                m_klein_stream.get(), in_config.prompt.value.c_str())
@@ -1458,11 +1415,7 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
       return;
     }
     m_klein_prompt = in_config.prompt.value;
-    m_klein_queue.clear();            // new prompt -> don't show stale interpolated frames
-    m_klein_frames.clear();           // and drop stale async sub-frames
-    m_klein_have_emit = false;
-    m_klein_drain_credit = 0.0;       // keep prod_rate (cadence unchanged), reset the credit
-    m_klein_have_prev_key = false;
+    m_klein_queue.clear();            // sync path: new prompt -> don't show stale interpolated frames
   }
 
   const int exp_now = std::clamp((int)in_config.rife_exp.value, 0, 3);
@@ -1482,7 +1435,7 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
     return;
   }
   // Left async -> ensure the producer is stopped so the sync path owns the contexts exclusively.
-  if (m_klein_producer.joinable())
+  if (m_klein_producer && m_klein_producer->running())
     stopKleinProducer();
 
   // ---- Task 2: RIFE display decoupling --------------------------------------------------------
@@ -1604,35 +1557,25 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
   m_prev_inputs = inputs;
 }
 
-// Phase C — steady-clock paced async klein. The diffusion runs on the dedicated producer thread
-// (kleinProducerLoop) on the klein stream's own low-prio CUDA stream; the render thread (this fn,
-// called once per score tick) NEVER blocks on it. Each tick:
-//   1. build the reference frame, push a latest-wins job to the producer when the sweep is consumed;
-//   2. consume a fresh keyframe from the triple_buffer (newest-wins) -> shift prev<-cur, rebuild the
-//      RIFE sweep ONCE, rebase the phase + update the keyframe-rate estimate;
-//   3. advance the phase by REAL elapsed wall-time scaled by the keyframe rate;
-//   4. emit ONE precomputed sub-frame (cheap memcpy) -> constant per-tick cost -> tight pacing.
+// Phase C — steady-clock paced async klein. Diffusion (+RIFE) runs on the producer thread on the klein
+// stream's own low-prio CUDA stream; the render thread (this fn, once per score tick) NEVER blocks. The
+// producer + credit-paced consumer are the SHARED AsyncFrameProducer/PacedFrameConsumer (see
+// presentAsync); this fn only builds the reference frame and hands off.
 void StreamDiffusion::runKleinAsync(const inputs_t& in_config)
 {
   const int w = m_klein_w, h = m_klein_h;
   const size_t nbytes = (size_t)w * h * 4;
   const int exp = std::clamp((int)in_config.rife_exp.value, 0, 3);
+  const int pacing = static_cast<int>(in_config.klein_pacing.value);
 
-  // The producer is lazily (re)started here (createKleinStream / set_prompt stop it). Cheap no-op when
-  // already running, BUT startKleinProducer() -> jthread ctor only the first time; instrument anyway.
-  startKleinProducer();
+  ensureKleinProducer();   // lazily (re)started; createKleinStream / set_prompt stop it on change.
 
-  // Per-tick wall-clock dt drives the credit-based FIFO drain (frames consumed this tick = prod_rate*dt).
-  const double tnow = now_s_steady();
-  double dt = (m_klein_last_tick_t > 0.0) ? (tnow - m_klein_last_tick_t) : 0.0;
-  m_klein_last_tick_t = tnow;
-  dt = std::clamp(dt, 0.0, 0.1);   // guard first tick / scheduler hiccup so the cursor never leaps
-
-  // --- 1. Build this tick's reference frame (img2img: input texture; txt2img: black). ---
+  // Build this tick's reference frame (img2img: input texture scaled to model res; txt2img: black).
   static thread_local std::vector<unsigned char> ref_frame;
   ref_frame.assign(nbytes, 0);
   bool have_input = true;
-  if (in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG)
+  const bool img2img = (in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG);
+  if (img2img)
   {
     if (inputs.image.texture.width <= 0 || inputs.image.texture.height <= 0
         || !inputs.image.texture.bytes)
@@ -1644,149 +1587,178 @@ void StreamDiffusion::runKleinAsync(const inputs_t& in_config)
           inputs.image.texture.height, QImage::Format_RGBA8888);
       if (inputs.image.texture.width != w || inputs.image.texture.height != h)
         in = in.scaled(QSize(w, h), Qt::IgnoreAspectRatio, Qt::FastTransformation);
-      std::memcpy(ref_frame.data(), in.constBits(),
-                  std::min<size_t>(nbytes, in.sizeInBytes()));
+      std::memcpy(ref_frame.data(), in.constBits(), std::min<size_t>(nbytes, in.sizeInBytes()));
     }
+  }
+
+  // txt2img: the black reference hashes constant -> submitted once (ref_constant_hash=true).
+  presentAsync(
+      *m_klein_producer, m_klein_consumer, ref_frame.data(), have_input, exp, m_klein_gen, pacing,
+      w, h, /*ref_constant_hash=*/!img2img,
+      m_klein_async_ref_hash, m_klein_async_ref_set, m_klein_async_exp, m_klein_last_tick_t);
+}
+
+// --- Generic async (option A) for SD/SD-turbo/SDXS/SDXL: plain txt2img/img2img ---------------------
+// Same producer/consumer machinery as klein, but the produce body calls the SD pipeline's blocking
+// txt2img/img2img (which already run on the pipeline's own CUDA stream and sync internally before
+// returning the host RGBA). The worker thread is the SOLE caller of the pipeline once started; the
+// main thread drains it (stopSDProducer) before any context mutation. CN/IP excluded (per-tick cond).
+
+bool StreamDiffusion::sdAsyncEligible(int8_t wf) noexcept
+{
+  switch (wf)
+  {
+    case StreamDiffusion::Workflow::SD_TXT2IMG:
+    case StreamDiffusion::Workflow::SDTURBO_TXT2IMG:
+    case StreamDiffusion::Workflow::SDXL_TXT2IMG:
+    case StreamDiffusion::Workflow::V2V_TXT2IMG:
+    case StreamDiffusion::Workflow::SD_IMG2IMG:
+    case StreamDiffusion::Workflow::SDTURBO_IMG2IMG:
+    case StreamDiffusion::Workflow::SDXL_IMG2IMG:
+    case StreamDiffusion::Workflow::V2V_IMG2IMG:
+      return true;
+    default:
+      return false;
+  }
+}
+
+void StreamDiffusion::ensureSDProducer()
+{
+  if (m_sd_producer && m_sd_producer->running())
+    return;
+  if (!m_sd_producer)
+  {
+    // The produce body runs on the worker thread and is the ONLY caller of the pipeline while running.
+    auto produce = [this](AsyncJob& job, AsyncFrame& out) -> bool {
+      if (!m_cached_engine || !m_cached_engine->pipeline)
+        return false;
+      auto pipe = m_cached_engine->pipeline->get();
+      const int w = job.w, h = job.h;
+      const size_t nb = (size_t)w * h * 4;
+      if (nb == 0)
+        return false;
+      out.w = w; out.h = h; out.gen = job.gen;
+      out.rgba.assign(nb, 0);
+
+      // 1. Diffuse the keyframe (blocking; the pipeline's own stream syncs internally before return).
+      bool diffused = false;
+      if (m_sd_async_img2img)
+      {
+        if (job.ref_rgba.size() < nb)
+          return false;
+        diffused = (m_sd.img2img(pipe, job.ref_rgba.data(), out.rgba.data(), w, h)
+                    == LIBREDIFFUSION_SUCCESS);
+      }
+      else
+      {
+        diffused = (m_sd.txt2img(pipe, out.rgba.data(), w, h) == LIBREDIFFUSION_SUCCESS);
+      }
+      if (!diffused)
+        return false;
+
+      // 2. RIFE the sweep prev->cur ON THIS THREAD (graceful: if the engine can't run at this
+      //    resolution, fall back to the single keyframe -> async still smooths pacing, just no interp).
+      if (job.exp > 0 && m_sd_have_prev_key)
+      {
+        if (!m_sd_producer_rife && !m_sd_rife_path.empty())
+        {
+          m_sd_producer_rife = SDRife{m_sd_rife_path.c_str()};
+          if (m_sd_producer_rife && m_sd.rife_set_enabled)
+            m_sd.rife_set_enabled(m_sd_producer_rife.get(), 1);
+        }
+        if (m_sd_producer_rife && m_sd.rife_set_interpolation_exp)
+          m_sd.rife_set_interpolation_exp(m_sd_producer_rife.get(), job.exp);
+        if (m_sd_producer_rife && m_sd.rife_interpolate
+            && m_sd_prev_key.size() >= nb)
+        {
+          const int n_max = 1 << job.exp;
+          out.sweep.assign((size_t)n_max * nb, 0);
+          int n = 0;
+          if (m_sd.rife_interpolate(m_sd_producer_rife.get(), m_sd_prev_key.data(),
+                                    out.rgba.data(), h, w, out.sweep.data(), &n)
+                  == LIBREDIFFUSION_SUCCESS && n > 0)
+            out.sweep_n = n;
+          else { out.sweep.clear(); out.sweep_n = 0; }
+        }
+      }
+
+      // 3. Remember this keyframe as the next sweep's prev (producer-thread-only state).
+      m_sd_prev_key = out.rgba;
+      m_sd_have_prev_key = true;
+      return true;
+    };
+    // rerun_when_idle = false: SD output is deterministic for a fixed (ref, seed); don't peg the GPU
+    // re-generating an identical frame. Live img2img submits a fresh job whenever the input moves.
+    m_sd_producer = std::make_unique<AsyncFrameProducer<AsyncJob, AsyncFrame>>(
+        std::move(produce), /*rerun_when_idle=*/false);
+  }
+
+  // Resolve the RIFE engine path once (model folder, else the shared fallback engine).
+  if (m_sd_rife_path.empty())
+  {
+    std::string rp = m_klein_model_path.empty()
+        ? std::string() : (m_klein_model_path + "/rife_ifnet_fp16.plan");
+    if (rp.empty() || !std::filesystem::exists(rp))
+      rp = "/media/data2/flux-trt/engine-rife/rife_ifnet_fp16.plan";
+    m_sd_rife_path = rp;
+  }
+  m_sd_producer->start();
+}
+
+void StreamDiffusion::stopSDProducer()
+{
+  if (m_sd_producer)
+    m_sd_producer->stop();
+  m_sd_consumer.reset();
+  m_sd_have_prev_key = false;
+  m_sd_prev_key.clear();
+  m_sd_producer_rife.reset();   // resolution may change on rebuild -> reload lazily
+  m_sd_async_ref_set = false;
+  m_sd_async_ref_hash = 0;
+  m_sd_async_exp = -1;
+  m_sd_last_tick_t = 0.0;
+}
+
+void StreamDiffusion::runSDAsync(
+    const inputs_t& in_config, unsigned char* input_tex_bytes, int w, int h)
+{
+  if (w <= 0 || h <= 0)
+    return;
+  const size_t nbytes = (size_t)w * h * 4;
+  const int exp = std::clamp((int)in_config.rife_exp.value, 0, 3);
+
+  // img2img iff not one of the four txt2img workflows (sdAsyncEligible already gated to these 8).
+  // Only assign while the producer is stopped — the worker reads this field, and a workflow change
+  // always drains the producer first (need_rebuild), so it stays stable+correct while running.
+  const bool img2img = !(in_config.workflow == Workflow::SD_TXT2IMG
+                         || in_config.workflow == Workflow::SDTURBO_TXT2IMG
+                         || in_config.workflow == Workflow::SDXL_TXT2IMG
+                         || in_config.workflow == Workflow::V2V_TXT2IMG);
+  if (!(m_sd_producer && m_sd_producer->running()))
+    m_sd_async_img2img = img2img;
+
+  ensureSDProducer();
+
+  // Build this tick's reference frame. img2img: the (already model-res-scaled) input texture from
+  // operator(); txt2img: a constant black frame (hashes constant -> submitted once).
+  static thread_local std::vector<unsigned char> ref_frame;
+  ref_frame.assign(nbytes, 0);
+  bool have_input = true;
+  if (m_sd_async_img2img)
+  {
+    if (!input_tex_bytes)
+      have_input = false;
+    else
+      std::memcpy(ref_frame.data(), input_tex_bytes, nbytes);
   }
 
   const int pacing = static_cast<int>(in_config.klein_pacing.value);
 
-  // --- 2. Drain the producer's freshly-published SWEEP into the SUB-FRAME FIFO. The render thread emits
-  //        ONE sub-frame per tick (sync's model) -> each RIFE sub-frame is shown exactly once, in order
-  //        = 0% dup, monotonic motion (the wall-clock fractional cursor repeated ~10% of frames -> choppy).
-  //        The pacing mode only controls how much we let the FIFO BUFFER (latency) vs stay fresh:
-  //          Smooth     : keep a few sweeps of slack so the FIFO never drains -> motion never stutters.
-  //          Fresh      : ~1 keyframe of slack -> low latency, occasional brief hold if the producer slips.
-  //          LowLatency : minimal slack -> if the producer falls behind, DROP backlog to stay live. ---
-  KleinRealFrame fresh;
-  if (m_klein_real_tb.consume(fresh) && fresh.gen == m_klein_gen)
-  {
-    // ADAPTIVE: measure the keyframe interval AND the PRODUCTION RATE (sub-frames/sec) from the actual
-    // arrivals — no hardcoded fps, self-calibrates to any GPU. Reject only physically-impossible gaps.
-    const int n = std::max(1, fresh.sweep_n);
-    if (m_klein_last_kf_t > 0.0)
-    {
-      const double gap = tnow - m_klein_last_kf_t;
-      if (gap > 1e-3 && gap < 5.0)
-      {
-        m_klein_kf_interval = (m_klein_kf_interval <= 0.0)
-            ? gap : 0.8 * m_klein_kf_interval + 0.2 * gap;
-        const double inst_rate = (double)n / gap;   // this sweep's sub-frames over the interval
-        m_klein_prod_rate = (m_klein_prod_rate <= 0.0)
-            ? inst_rate : 0.8 * m_klein_prod_rate + 0.2 * inst_rate;
-      }
-    }
-    m_klein_last_kf_t = tnow;
-
-    // Latency budget = how many sub-frames we tolerate buffered ahead before trimming. A sweep contributes
-    // sweep_n sub-frames; we express the budget in sweeps so it scales with exp.
-    const int budget_sweeps = (pacing == StreamDiffusion::Smooth) ? 3
-                            : (pacing == StreamDiffusion::Fresh)  ? 2 : 1;
-    const size_t max_frames = (size_t)budget_sweeps * n;
-
-    // Append this sweep's sub-frames in display order (sweep[0..n-1]; sweep ends at the new keyframe).
-    if (fresh.sweep_n > 1 && fresh.sweep.size() >= (size_t)n * nbytes)
-    {
-      for (int i = 0; i < n; ++i)
-        m_klein_frames.emplace_back(
-            fresh.sweep.begin() + (size_t)i * nbytes, fresh.sweep.begin() + (size_t)(i + 1) * nbytes);
-    }
-    else
-    {
-      m_klein_frames.emplace_back(fresh.rgba);   // no interpolation -> the single keyframe
-    }
-
-    // Trim from the FRONT (drop the stalest queued frames) if we're over budget -> bounds latency. This
-    // is where the modes differ: Smooth allows the most slack, LowLatency the least.
-    while (m_klein_frames.size() > max_frames)
-      m_klein_frames.pop_front();
-  }
-
-  // --- 4. Keep the producer SATURATED: submit a new job whenever it's idle (decoupled from display). The
-  //        producer diffuses + RIFEs flat-out on its own thread; the render thread never blocks. ---
-  // Publish the freshest reference whenever it CHANGES (newest-wins, lock-free). NOT gated on producer-
-  // busy: the producer self-rearms and runs flat-out, so it's almost always busy; gating here would
-  // starve live-video ref updates. The producer consumes the latest job at the top of each keyframe;
-  // between changes it reuses the last job (re-diffusing the same ref is correct + keeps it saturated).
-  if (have_input)
-  {
-    const uint64_t rh = rapidhash(ref_frame.data(), nbytes);
-    if (!m_klein_async_ref_set || rh != m_klein_async_ref_hash)
-    {
-      KleinJob job;
-      job.ref_rgba = ref_frame;           // copy: the producer owns its input
-      job.ref_changed = true;             // ref genuinely changed -> producer re-encodes once
-      job.w = w; job.h = h;
-      job.exp = exp;                      // the producer renders the RIFE sweep at this exp
-      job.gen = m_klein_gen;
-      job.valid = true;
-      m_klein_job_tb.produce(std::move(job));
-      m_klein_job_ready.store(true, std::memory_order_release);
-      m_klein_job_cv.notify_one();
-      m_klein_async_ref_hash = rh;
-      m_klein_async_ref_set = true;
-    }
-    else if (exp != m_klein_exp)
-    {
-      // ref unchanged but interpolation factor changed -> push a job so the producer adopts the new exp.
-      KleinJob job;
-      job.ref_rgba = ref_frame;
-      job.ref_changed = false;            // ref already cached
-      job.w = w; job.h = h;
-      job.exp = exp;
-      job.gen = m_klein_gen;
-      job.valid = true;
-      m_klein_job_tb.produce(std::move(job));
-      m_klein_job_ready.store(true, std::memory_order_release);
-      m_klein_job_cv.notify_one();
-    }
-    m_klein_exp = exp;
-  }
-
-  // --- 5/6. PRESENT via CREDIT-BASED EVEN-SPREAD DRAIN. Advance the FIFO by the MEASURED production rate,
-  //          not 1-per-tick. credit += prod_rate*dt; pop floor(credit) frames (keep the remainder). This
-  //          spreads repeats (content<display) and skips (content>display, bigger GPU) EVENLY across time
-  //          instead of bunching them -> smoothness matches sync regardless of the GPU's actual fps. ---
-  if (m_klein_prod_rate > 0.0)
-    m_klein_drain_credit += m_klein_prod_rate * dt;
-  else
-    m_klein_drain_credit += 1.0;   // before the rate is known, fall back to 1-per-tick
-
-  int to_pop = (int)m_klein_drain_credit;
-  if (to_pop > 0)
-  {
-    m_klein_drain_credit -= (double)to_pop;
-    // Don't let the credit run away if the FIFO is short (cap to what's available + keep fraction sane).
-    while (to_pop > 0 && !m_klein_frames.empty())
-    {
-      m_klein_last_emit = std::move(m_klein_frames.front());
-      m_klein_frames.pop_front();
-      m_klein_have_emit = true;
-      --to_pop;
-    }
-    // FIFO drained before satisfying the credit -> we're content-starved this instant; drop the unmet
-    // credit (don't bank it, or we'd skip-burst when frames arrive) and hold the last frame.
-    if (to_pop > 0)
-      m_klein_drain_credit = 0.0;
-  }
-  // else: credit < 1 this tick -> emit NOTHING new, hold the last frame (an EVENLY-spaced repeat).
-
-  if (!m_klein_have_emit)
-    return;   // nothing produced yet (producer warming up)
-
-  this->outputs.image.create(w, h);
-  std::memcpy(outputs.image.texture.bytes, m_klein_last_emit.data(),
-              std::min<size_t>(nbytes, m_klein_last_emit.size()));
-  outputs.image.texture.changed = true;
-
-  // Live FPS dump: instantaneous RECEIVER (display/present) rate = 1 / time-since-last-present.
-  {
-    const double rfps = (m_klein_dbg_last_emit_t > 0.0)
-        ? 1.0 / std::max(1e-6, tnow - m_klein_dbg_last_emit_t) : 0.0;
-    m_klein_dbg_last_emit_t = tnow;
-    qDebug().nospace() << "[klein-RECEIVER] " << rfps << " fps (display)  prod_rate="
-                       << m_klein_prod_rate << " fifo=" << (int)m_klein_frames.size();
-  }
+  // Shared render-side driver: submit on ref/exp change, consume, present one paced frame.
+  presentAsync(
+      *m_sd_producer, m_sd_consumer, ref_frame.data(), have_input, exp, m_sd_gen, pacing, w, h,
+      /*ref_constant_hash=*/!m_sd_async_img2img,
+      m_sd_async_ref_hash, m_sd_async_ref_set, m_sd_async_exp, m_sd_last_tick_t);
 }
 
 void StreamDiffusion::operator()()
@@ -1870,6 +1842,20 @@ void StreamDiffusion::operator()()
 
   if (in_config.prompt.value.empty())
     return;
+
+  // If a background SD producer is running, any main-thread mutation of the TRT context below
+  // (rebuild / scheduler / embeds / reseed / guidance / delta) would race it. Drain+join first; the
+  // async render path restarts it lazily once the context is stable again. Change-gated -> only fires
+  // on an actual config change, so a steady stream never stalls here. (Bump the generation so any
+  // in-flight job/frame from the old config is dropped by the consumer.)
+  if (m_sd_producer && m_sd_producer->running()
+      && (need_rebuild || need_update_scheduler || need_update_positive_embeds
+          || need_update_negative_embeds || need_reseed || need_update_guidance
+          || need_update_delta))
+  {
+    stopSDProducer();
+    ++m_sd_gen;
+  }
 
   // Create or reinit pipeline if needed
   if (need_rebuild || !m_cached_engine || !m_cached_engine->pipeline)
@@ -2061,6 +2047,23 @@ void StreamDiffusion::operator()()
         return;
       }
     }
+  }
+
+  // Async (option A): for plain SD/SDXL txt2img/img2img, diffuse on a background producer thread
+  // (it blocks on the pipeline's own CUDA stream) and present steady-clock-paced frames here, so a
+  // slow model (e.g. SDXL @1024 ~10fps) never stalls the score tick and RIFE can fill between
+  // keyframes. CN/IP workflows upload conditioning every tick on this thread and are excluded for now.
+  if (in_config.klein_async.value && sdAsyncEligible(in_config.workflow.value))
+  {
+    runSDAsync(in_config, input_tex_bytes, model_tex_w, model_tex_h);
+    m_prev_inputs = inputs;
+    return;
+  }
+  // Not async (or not eligible): ensure no background producer is left running on this pipeline.
+  if (m_sd_producer && m_sd_producer->running())
+  {
+    stopSDProducer();
+    ++m_sd_gen;
   }
 
   // Run inference
