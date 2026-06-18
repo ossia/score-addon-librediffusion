@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
 
 project(score_addon_librediffusion LANGUAGES CXX)
 
+# Max/MSP externals link the static CRT (/MT) on Windows, as the official
+# max-sdk-base requires. Set it for the whole addon -- before Avendish and the
+# object library are created -- so every target shares one runtime; mixing /MT
+# and /MD trips MSVC with LNK2038. (CMP0091 is NEW via cmake_minimum_required.)
+if(MSVC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # Addon requires CUDA Toolkit; only Windows / Linux.
 if((NOT WIN32) AND (NOT LINUX))
   return()
@@ -14,7 +22,7 @@ if(NOT Avendish_FOUND)
   FetchContent_Declare(
     Avendish
     GIT_REPOSITORY "https://github.com/celtera/avendish"
-    GIT_TAG main)
+    GIT_TAG 7eafe173)
   FetchContent_Populate(Avendish)
   list(APPEND CMAKE_PREFIX_PATH "${avendish_SOURCE_DIR}")
   find_package(Avendish REQUIRED)
