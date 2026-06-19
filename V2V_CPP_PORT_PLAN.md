@@ -173,7 +173,21 @@ read 16 `kvo_cache_out_*` `[2,1,B,seq,h]`, then roll bank `-1` on dim1 and write
 - [ ] Host: every `interval` frames, cat bank+new then run the kernel → compacted bank. Dynamic bank size → ensure the engine profile's max `seq` covers the compacted span.
 - [ ] **Gate:** C++ full path == `golden_full` (see tolerances below).
 
-### 3.5 — C-API + node wiring
+### 3.5 — C-API + node wiring  ✅ RUNTIME WIRED 2026-06-18 (export --v2v flag = the one remaining piece)
+- ✅ C-API: `config_set_temporal_params(use_cached_attn, use_feature_injection, injection_strength,
+  similarity_threshold, cache_interval, cache_maxframes)` already plumbs the extended-attn kvo path
+  (cache_maxframes → forward_v2v); injection/threshold are inert for the extended-attn engine (future
+  injection/ToMe baking). `reset_temporal_state` clears the bank.
+- ✅ Node (LibreDiffusion.cpp): `V2V_IMG2IMG`/`V2V_TXT2IMG` → `MODE_TEMPORAL_V2V` → `config_set_temporal_params`
+  with `cache_maxframes=2` (the validated default; was hardcoded 1) + cuda-graph disabled for v2v.
+  Runtime path node→.so→kvo-engine is complete; point the node at a kvo unet.engine and v2v is live.
+- ⏳ REMAINING: `train-lora.py --v2v` to EXPORT a kvo UNet self-contained (pass a non-empty
+  `kvo_cache_structure` to UNet + UnifiedExportWrapper, install the extended-attn TRT processors, run the
+  vendored `fix_klein_dynamic_seq`-style fixups if needed) and set `features.v2v=true` in bundle.json.
+  Today the working kvo engine is the daydream-built one at /media/data2/v2v-kvo (TRT-RTX 11, loads in C++);
+  the export-flag makes it reproducible from our own toolchain. write_manifest already accepts the flag.
+
+#### original 3.5 checklist
 - [ ] C-API: extend the v2v entry (set_reference / per-frame) with params `interval, cache_maxframes, fi_strength, threshold, tome_ratio, use_feature_injection, use_tome`. Keep the existing `librediffusion_enable/disable/reset_temporal` surface; reset clears the banks.
 - [ ] Wire into the score node (`LibreDiffusion/LibreDiffusion.cpp`) — the user builds the node; we only build the `.so`.
 - [ ] Update `bundle.json` manifest: a v2v UNet engine sets `features.v2v=true` (the export emits it).

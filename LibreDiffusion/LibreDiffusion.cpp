@@ -861,17 +861,23 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
       config.get(), m_config_state.timestep_indices.data(),
       m_config_state.timestep_indices.size());
 
-  // Temporal coherence settings for V2V mode
+  // Temporal coherence settings for V2V mode. The live C++ StreamV2V is the kvo_cache extended
+  // self-attention path (forward_v2v): each frame's K/V is banked and concatenated into the next
+  // frame's self-attention. cache_maxframes = how many previous frames the bank holds (engine
+  // profile supports up to 4); 2 is the validated default (matches the Python kvo golden, ~50 dB).
+  // use_feature_injection / injection_strength / similarity_threshold are INERT for the extended-attn
+  // engine (feature-injection + ToMe are not bakeable into the static TRT graph — a future phase);
+  // they are passed for forward-compat with a future injection-capable engine.
   if(pipeline_mode == MODE_TEMPORAL_V2V)
   {
     m_sd.config_set_temporal_params(
         config.get(),
-        1,                            // use_cached_attn
-        in_config.add_noise ? 1 : 0,  // use_feature_injection
-        0.8f,                         // injection_strength
-        0.78f,                        // similarity_threshold
-        1,                            // cache_interval
-        1);                           // cache_maxframes
+        1,                            // use_cached_attn (extended self-attention banking)
+        in_config.add_noise ? 1 : 0,  // use_feature_injection (inert for extended-attn engines)
+        0.8f,                         // injection_strength (inert)
+        0.78f,                        // similarity_threshold (inert)
+        1,                            // cache_interval (bank every frame)
+        2);                           // cache_maxframes (bank the previous 2 frames; profile max 4)
   }
 
   // ControlNet / IP-Adapter engines (controlnet.engine + the control-aware or
