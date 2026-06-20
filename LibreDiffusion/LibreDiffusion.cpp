@@ -644,6 +644,7 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
       break;
     case Workflow::FLUX2_KLEIN_TXT2IMG:
     case Workflow::FLUX2_KLEIN_IMG2IMG:
+    case Workflow::FLUX2_KLEIN_INPAINT:
       // Handled by the dedicated klein streaming path (runKlein); never reached here.
       return false;
   }
@@ -1205,6 +1206,7 @@ bool StreamDiffusion::createKleinStream(const inputs_t& in_config)
   m_klein_h = h;
   m_klein_prompt.clear();
   m_klein_sched.clear();   // force re-apply of the Timesteps->schedule on the next runKlein tick
+  m_klein_mask_hash = 0;   // force re-apply of the inpaint mask on the next runKlein tick
   m_klein_have_prev = false;
   m_klein_prev_out.assign((size_t)w * h * 4, 0);
   // reset the cached reference + the RIFE display queue on (re)create
@@ -1468,6 +1470,31 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
     m_klein_queue.clear();
   }
 
+  // Inpaint mask: klein has no ControlNet/IP-Adapter, so the "Control / Style" texture is repurposed as
+  // the inpaint mask (white = regenerate, black = keep; absent = no inpaint). set_mask mutates the
+  // stream mask the producer reads, so drain+join first (same reason as set_prompt/set_schedule).
+  {
+    const bool inpaint = (in_config.workflow == Workflow::FLUX2_KLEIN_INPAINT);
+    const auto& mt = in_config.control.texture;
+    const uint64_t mh = (inpaint && mt.width > 0 && mt.height > 0 && mt.bytes)
+        ? rapidhash(mt.bytes, (size_t)mt.width * mt.height * 4) : 0ull;
+    if (mh != m_klein_mask_hash && m_sd.flux2_stream_set_mask)
+    {
+      stopKleinProducer();
+      if (mh != 0)
+      {
+        QImage mimg(mt.bytes, mt.width, mt.height, QImage::Format_RGBA8888);
+        if (mt.width != m_klein_w || mt.height != m_klein_h)
+          mimg = mimg.scaled(QSize(m_klein_w, m_klein_h), Qt::IgnoreAspectRatio, Qt::FastTransformation);
+        m_sd.flux2_stream_set_mask(m_klein_stream.get(), mimg.constBits(), m_klein_h, m_klein_w);
+      }
+      else
+        m_sd.flux2_stream_set_mask(m_klein_stream.get(), nullptr, 0, 0);  // no mask -> disable inpaint
+      m_klein_mask_hash = mh;
+      m_klein_queue.clear();
+    }
+  }
+
   const int exp_now = std::clamp((int)in_config.rife_exp.value, 0, 3);
   if (exp_now != m_klein_last_exp)
   {
@@ -1510,7 +1537,8 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
   static thread_local std::vector<unsigned char> ref_frame;
   ref_frame.assign((size_t)w * h * 4, 0);
 
-  if (in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG)
+  if (in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG
+      || in_config.workflow == Workflow::FLUX2_KLEIN_INPAINT)
   {
     if (inputs.image.texture.width <= 0 || inputs.image.texture.height <= 0
         || !inputs.image.texture.bytes)
@@ -1624,7 +1652,8 @@ void StreamDiffusion::runKleinAsync(const inputs_t& in_config)
   static thread_local std::vector<unsigned char> ref_frame;
   ref_frame.assign(nbytes, 0);
   bool have_input = true;
-  const bool img2img = (in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG);
+  const bool img2img = (in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG
+                        || in_config.workflow == Workflow::FLUX2_KLEIN_INPAINT);
   if (img2img)
   {
     if (inputs.image.texture.width <= 0 || inputs.image.texture.height <= 0
@@ -1825,7 +1854,8 @@ void StreamDiffusion::operator()()
   // tokenizer, scheduler and noise handled inside the C-API). It does not use the
   // SD pipeline / CLIP / EngineCache machinery, so dispatch it early.
   if(in_config.workflow == Workflow::FLUX2_KLEIN_TXT2IMG
-     || in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG)
+     || in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG
+     || in_config.workflow == Workflow::FLUX2_KLEIN_INPAINT)
   {
     runKlein(in_config);
     return;
@@ -1928,6 +1958,7 @@ void StreamDiffusion::operator()()
   {
     case Workflow::FLUX2_KLEIN_TXT2IMG:
     case Workflow::FLUX2_KLEIN_IMG2IMG:
+    case Workflow::FLUX2_KLEIN_INPAINT:
       // Handled by runKlein() above; never reached here.
       return;
     case Workflow::SD_TXT2IMG:
@@ -2121,6 +2152,7 @@ void StreamDiffusion::operator()()
   {
     case Workflow::FLUX2_KLEIN_TXT2IMG:
     case Workflow::FLUX2_KLEIN_IMG2IMG:
+    case Workflow::FLUX2_KLEIN_INPAINT:
       // Handled by runKlein() above; never reached here.
       return;
     case Workflow::SD_TXT2IMG:
