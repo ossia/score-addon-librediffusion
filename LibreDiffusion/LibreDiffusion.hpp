@@ -218,6 +218,7 @@ public:
     V2V_IMG2IMG,
     FLUX2_KLEIN_TXT2IMG,
     FLUX2_KLEIN_IMG2IMG,
+    FLUX2_KLEIN_INPAINT,
   };
 
   enum KleinQuality : int8_t
@@ -407,6 +408,7 @@ private:
   int m_klein_h{0};
   std::string m_klein_prompt;
   std::string m_klein_sched;                   // last-applied Timesteps string (klein sigma schedule)
+  uint64_t m_klein_mask_hash{0};               // hash of the last-applied inpaint mask (0 = none)
   std::vector<unsigned char> m_klein_prev_out; // last real klein frame, for RIFE
   std::vector<unsigned char> m_rife_scratch;   // (2^exp) frames buffer
   bool m_klein_have_prev{false};
