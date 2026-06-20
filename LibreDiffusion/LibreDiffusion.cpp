@@ -160,6 +160,31 @@ static std::vector<int> get_steps(std::string s)
   return result;
 }
 
+// Parse the Timesteps control as klein/FLUX FlowMatch sigmas (native scale): comma-separated floats,
+// high->low, each in (0,1]. Returns {} if any value is out of (0,1] (e.g. the SD-style "15, 25" default),
+// signalling the caller to fall back to the model's natural 2-step schedule. Used only for klein bundles.
+static std::vector<float> get_sigmas(std::string s)
+{
+  std::vector<float> out;
+  std::size_t i = 0;
+  while(i < s.size())
+  {
+    std::size_t j = s.find(',', i);
+    if(j == std::string::npos) j = s.size();
+    std::string tok = s.substr(i, j - i);
+    try {
+      std::size_t pos = 0;
+      float v = std::stof(tok, &pos);
+      if(pos > 0) out.push_back(v);
+    } catch(...) { /* skip non-numeric token */ }
+    i = j + 1;
+  }
+  // Validate as sigmas: non-empty and every entry in (0,1]. Otherwise it's not a klein schedule.
+  if(out.empty()) return {};
+  for(float v : out) if(v <= 0.f || v > 1.f) return {};
+  return out;
+}
+
 // True for every workflow that drives a ControlNet (control-aware unet.engine +
 // controlnet.engine): SD1.5 / SDXL, txt2img and img2img. ControlNet conditioning
 // is orthogonal to txt2img/img2img — only the starting latent differs (txt2img =
@@ -1179,6 +1204,7 @@ bool StreamDiffusion::createKleinStream(const inputs_t& in_config)
   m_klein_w = w;
   m_klein_h = h;
   m_klein_prompt.clear();
+  m_klein_sched.clear();   // force re-apply of the Timesteps->schedule on the next runKlein tick
   m_klein_have_prev = false;
   m_klein_prev_out.assign((size_t)w * h * 4, 0);
   // reset the cached reference + the RIFE display queue on (re)create
@@ -1422,6 +1448,24 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
     }
     m_klein_prompt = in_config.prompt.value;
     m_klein_queue.clear();            // sync path: new prompt -> don't show stale interpolated frames
+  }
+
+  // Timesteps control -> klein FlowMatch sigma schedule (native scale, high->low in (0,1]). It SUBSUMES
+  // steps + strength: list length = steps, first value = start noise level (=img2img strength). Falls
+  // back to the natural 2-step when the field isn't a valid klein sigma list (e.g. the SD-style "15, 25"
+  // default, or integers > 1). set_schedule mutates the stream schedule the producer thread reads in
+  // denoise_decode_ref, so drain+join the producer first (same threading reason as set_prompt above).
+  if (m_klein_sched != in_config.t1.value)
+  {
+    stopKleinProducer();
+    auto sigmas = get_sigmas(in_config.t1.value);
+    if (!sigmas.empty() && m_sd.flux2_stream_set_schedule)
+      m_sd.flux2_stream_set_schedule(
+          m_klein_stream.get(), sigmas.data(), (int)sigmas.size());
+    else if (m_sd.flux2_stream_set_steps)
+      m_sd.flux2_stream_set_steps(m_klein_stream.get(), 2);  // natural dynamic-shift 2-step
+    m_klein_sched = in_config.t1.value;
+    m_klein_queue.clear();
   }
 
   const int exp_now = std::clamp((int)in_config.rife_exp.value, 0, 3);
