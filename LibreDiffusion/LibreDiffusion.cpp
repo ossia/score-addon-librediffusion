@@ -10,7 +10,7 @@
 #include "schedulers/sdxl-turbo.hpp"
 
 #include <ossia/detail/fmt.hpp>
-#include <ossia/detail/small_vector.hpp>
+#include <boost/container/small_vector.hpp>
 
 #include <ctre.hpp>
 #include <rapidhash.h>
@@ -1036,8 +1036,8 @@ bool StreamDiffusion::updatePromptEmbeddings(const std::string& prompt, std::vec
   // Split if necessary:
   if (auto weights = parse_input_string(prompt))
   {
-    ossia::small_vector<float, 8> bweight;
-    ossia::small_vector<librediffusion_half_t*, 8> bembeds;
+    boost::container::small_vector<float, 8> bweight;
+    boost::container::small_vector<librediffusion_half_t*, 8> bembeds;
     for (const auto& [k, v] : *weights)
     {
       SDXLEmbeddings e;
