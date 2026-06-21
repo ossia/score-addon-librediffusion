@@ -16,8 +16,9 @@ jobs:
     secrets: inherit
 
   # Build the same object(s) standalone, one artifact per back-end.
-  # CATEGORY object (default, no CATEGORY/BACKENDS declared): data / message
-  # back-ends. wasm omitted: links CUDA/TensorRT (librediffusion), desktop-only.
+  # ML / inference object: the StreamDiffusion engine links CUDA + TensorRT,
+  # so the object is desktop-only (win/linux) and CMake returns early elsewhere.
+  # wasm omitted: no WebAssembly CUDA/TensorRT build.
   standalone:
     uses: ossia/actions/.github/workflows/avnd-addon.yml@master
     secrets: inherit
