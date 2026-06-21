@@ -8,6 +8,7 @@
 
 #include <QImage>
 
+#include <halp/buffer.hpp>
 #include <halp/controls.hpp>
 #include <halp/meta.hpp>
 #include <halp/texture.hpp>
@@ -132,6 +133,28 @@ private:
   librediffusion_rife_handle m_handle{nullptr};
 };
 
+/**
+ * @brief RAII wrapper around an img2img-turbo (GaParmar/img2img-turbo) skip-VAE pipeline handle.
+ */
+class SDImg2ImgTurbo
+{
+public:
+  SDImg2ImgTurbo() = default;
+  SDImg2ImgTurbo(const char* unet, const char* vae_encoder, const char* vae_decoder);
+  ~SDImg2ImgTurbo();
+  SDImg2ImgTurbo(const SDImg2ImgTurbo&) = delete;
+  SDImg2ImgTurbo& operator=(const SDImg2ImgTurbo&) = delete;
+  SDImg2ImgTurbo(SDImg2ImgTurbo&& other) noexcept;
+  SDImg2ImgTurbo& operator=(SDImg2ImgTurbo&& other) noexcept;
+
+  explicit operator bool() const noexcept { return m_handle != nullptr; }
+  librediffusion_img2img_turbo_handle get() const noexcept { return m_handle; }
+  void reset();
+
+private:
+  librediffusion_img2img_turbo_handle m_handle{nullptr};
+};
+
 struct SDXLEmbeddings
 {
   librediffusion_half_t* embeddings{nullptr};
@@ -219,6 +242,10 @@ public:
     FLUX2_KLEIN_TXT2IMG,
     FLUX2_KLEIN_IMG2IMG,
     FLUX2_KLEIN_INPAINT,
+    // github.com/GaParmar/img2img-turbo (pix2pix-turbo / CycleGAN-turbo skip-VAE). One-step image
+    // translation: input frame + a CLIP text embedding (via the "Embedding" port) -> output.
+    // NOT a generic SD-turbo img2img workflow. Self-contained C-API (librediffusion_img2img_turbo_*).
+    IMG2IMG_TURBO,
   };
 
   enum KleinQuality : int8_t
@@ -252,6 +279,11 @@ public:
     // Preprocessing is EXTERNAL: feed an already-preprocessed control map here for
     // ControlNet. Only used by the *_CONTROLNET / *_IPADAPTER workflows.
     halp::texture_input<"Control / Style"> control;
+    // img2img-turbo (IMG2IMG_TURBO) only: the CLIP text embedding [1,77,1024] = 78848 floats, fed from
+    // upstream (a prompt-encoder object, or a baked constant for the CycleGAN day2night/etc. models).
+    // Keeps CLIP-text out of this node. Unused by every other workflow. (A plain float list, not a
+    // texture/cpu_buffer: GFX nodes only accept parameter/texture inputs, so it rides on a value port.)
+    halp::val_port<"Embedding", std::vector<float>> ehs;
     halp::val_port<"Trigger", std::optional<halp::impulse>> trigger;
     struct : halp::enum_t<Workflow, "Workflow">
     {
@@ -399,6 +431,16 @@ private:
   // FLUX.2-klein streaming path (self-contained, bypasses the SD pipeline machinery)
   void runKlein(const inputs_t& in_config);
   bool createKleinStream(const inputs_t& in_config);
+
+  // img2img-turbo path (self-contained skip-VAE C-API; static 512x512, one-step, host RGBA bytes)
+  void runImg2ImgTurbo(const inputs_t& in_config);
+  SDImg2ImgTurbo m_i2it;
+  std::string m_i2it_model_path;
+  std::vector<unsigned char> m_i2it_in;   // input frame, RGBA8 512x512 (persistent scratch)
+  std::vector<unsigned char> m_i2it_out;  // output frame, RGBA8 512x512 (persistent scratch)
+  SDClip m_i2it_clip;                      // CLIP encoder (prompt -> embedding), like SD/SDXL
+  SDXLEmbeddings m_i2it_embeddings;        // device fp16 [1,77,1024] derived from the prompt
+  std::string m_i2it_prompt;               // last prompt, to recompute only on change
 
   SDFluxStream m_klein_stream;
   SDRife m_rife;
