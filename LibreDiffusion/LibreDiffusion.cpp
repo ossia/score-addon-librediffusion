@@ -433,6 +433,47 @@ SDRife& SDRife::operator=(SDRife&& other) noexcept
   return *this;
 }
 
+SDImg2ImgTurbo::SDImg2ImgTurbo(
+    const char* unet, const char* vae_encoder, const char* vae_decoder)
+{
+  const auto& sd = sd::liblibrediffusion::instance();
+  if (sd.available && sd.img2img_turbo_create)
+    m_handle = sd.img2img_turbo_create(unet, vae_encoder, vae_decoder);
+}
+
+SDImg2ImgTurbo::~SDImg2ImgTurbo()
+{
+  reset();
+}
+
+void SDImg2ImgTurbo::reset()
+{
+  if (m_handle)
+  {
+    const auto& sd = sd::liblibrediffusion::instance();
+    if (sd.available && sd.img2img_turbo_destroy)
+      sd.img2img_turbo_destroy(m_handle);
+    m_handle = nullptr;
+  }
+}
+
+SDImg2ImgTurbo::SDImg2ImgTurbo(SDImg2ImgTurbo&& other) noexcept
+    : m_handle{other.m_handle}
+{
+  other.m_handle = nullptr;
+}
+
+SDImg2ImgTurbo& SDImg2ImgTurbo::operator=(SDImg2ImgTurbo&& other) noexcept
+{
+  if (this != &other)
+  {
+    reset();
+    m_handle = other.m_handle;
+    other.m_handle = nullptr;
+  }
+  return *this;
+}
+
 SDXLEmbeddings::~SDXLEmbeddings()
 {
   reset();
@@ -1635,6 +1676,97 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
   m_prev_inputs = inputs;
 }
 
+// github.com/GaParmar/img2img-turbo: one-step image translation through the self-contained skip-VAE
+// C-API. Static 512x512. Host RGBA bytes in/out (the C-API does the device work internally, like
+// klein's flux2_stream_frame). The CLIP text embedding comes from the "Embedding" buffer inlet
+// (upstream prompt-encoder, or a baked CycleGAN constant) — no CLIP in this node. Synchronous.
+void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
+{
+  if (!m_sd.available || !m_sd.img2img_turbo_create || !m_sd.img2img_turbo_frame)
+  {
+    qDebug() << "img2img-turbo: library does not export the img2img-turbo API";
+    return;
+  }
+
+  // The engines are static 512x512 (see the export). Resolution control is ignored for this workflow.
+  constexpr int w = 512, h = 512;
+
+  // (Re)create the pipeline when the model (engine folder) changes.
+  if (!m_i2it || m_i2it_model_path != in_config.model.value)
+  {
+    const std::string unet = in_config.model.value + "/unet.engine";
+    const std::string venc = in_config.model.value + "/vae_encoder.engine";
+    const std::string vdec = in_config.model.value + "/vae_decoder.engine";
+    m_i2it = SDImg2ImgTurbo{unet.c_str(), venc.c_str(), vdec.c_str()};
+    m_i2it_model_path = in_config.model.value;
+    if (!m_i2it)
+    {
+      qDebug() << "img2img-turbo: create failed for" << in_config.model.value.c_str();
+      return;
+    }
+    // CLIP encoder so the embedding can be derived from the Prompt (sd-turbo, pad 0, dim 1024).
+    const std::string clip = in_config.model.value + "/clip.engine";
+    m_i2it_clip = SDClip{clip.c_str()};
+    m_i2it_embeddings.reset();
+    m_i2it_prompt.clear();
+  }
+
+  // Recompute the prompt-derived embedding only when the prompt changes.
+  if (m_i2it_clip && m_i2it_prompt != in_config.prompt.value)
+  {
+    m_i2it_embeddings.reset();
+    librediffusion_error_t cerr = m_sd.clip_compute_embeddings(
+        m_i2it_clip.get(), in_config.prompt.value.c_str(), 0, nullptr,
+        &m_i2it_embeddings.embeddings);
+    if (cerr != LIBREDIFFUSION_SUCCESS)
+      m_i2it_embeddings.embeddings = nullptr;
+    m_i2it_prompt = in_config.prompt.value;
+  }
+
+  // Input frame -> RGBA8 512x512 (Canny / any preprocessing is upstream; we feed the In frame as-is).
+  if (inputs.image.texture.width <= 0 || inputs.image.texture.height <= 0
+      || !inputs.image.texture.bytes)
+    return;
+  m_i2it_in.assign((size_t)w * h * 4, 0);
+  QImage in(
+      inputs.image.texture.bytes, inputs.image.texture.width, inputs.image.texture.height,
+      QImage::Format_RGBA8888);
+  if (inputs.image.texture.width != w || inputs.image.texture.height != h)
+    in = in.scaled(QSize(w, h), Qt::IgnoreAspectRatio, Qt::FastTransformation);
+  std::memcpy(
+      m_i2it_in.data(), in.constBits(), std::min<size_t>((size_t)w * h * 4, in.sizeInBytes()));
+
+  // Embedding [1,77,1024]: the explicit "Embedding" port overrides; otherwise use the prompt-derived
+  // device fp16 from CLIP. Skip the frame if neither is available.
+  m_i2it_out.assign((size_t)w * h * 4, 0);
+  librediffusion_error_t err = LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  if (inputs.ehs.value.size() >= (size_t)77 * 1024)
+  {
+    err = m_sd.img2img_turbo_frame(
+        m_i2it.get(), m_i2it_in.data(), inputs.ehs.value.data(), m_i2it_out.data());
+  }
+  else if (m_i2it_embeddings.embeddings && m_sd.img2img_turbo_frame_dev)
+  {
+    err = m_sd.img2img_turbo_frame_dev(
+        m_i2it.get(), m_i2it_in.data(), m_i2it_embeddings.embeddings, m_i2it_out.data());
+  }
+  else
+  {
+    return; // nothing to translate without a text embedding
+  }
+  if (err != LIBREDIFFUSION_SUCCESS)
+  {
+    qDebug() << "img2img-turbo: frame failed" << (int)err;
+    return;
+  }
+
+  this->outputs.image.create(w, h);
+  std::memcpy(outputs.image.texture.bytes, m_i2it_out.data(), (size_t)w * h * 4);
+  outputs.image.texture.changed = true;
+
+  m_prev_inputs = inputs;
+}
+
 // Phase C — steady-clock paced async klein. Diffusion (+RIFE) runs on the producer thread on the klein
 // stream's own low-prio CUDA stream; the render thread (this fn, once per score tick) NEVER blocks. The
 // producer + credit-paced consumer are the SHARED AsyncFrameProducer/PacedFrameConsumer (see
@@ -1858,6 +1990,13 @@ void StreamDiffusion::operator()()
      || in_config.workflow == Workflow::FLUX2_KLEIN_INPAINT)
   {
     runKlein(in_config);
+    return;
+  }
+
+  // img2img-turbo likewise has its own self-contained skip-VAE C-API (no SD pipeline / CLIP / scheduler).
+  if(in_config.workflow == Workflow::IMG2IMG_TURBO)
+  {
+    runImg2ImgTurbo(in_config);
     return;
   }
 
