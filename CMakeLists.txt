@@ -10,8 +10,12 @@ if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# Addon requires CUDA Toolkit; only Windows / Linux.
+# Addon requires CUDA Toolkit; only Windows / Linux. On other platforms (macOS)
+# the object cannot be built at all. Register a no-op install rule before bailing
+# out so the score-addon CI's `cmake --build --target install` step is a clean
+# success instead of failing with "No rule to make target install".
 if((NOT WIN32) AND (NOT LINUX))
+  install(CODE "message(STATUS \"score-addon-librediffusion: skipped on this platform (requires CUDA)\")")
   return()
 endif()
 
@@ -32,9 +36,9 @@ if(COMMAND score_common_setup)
   score_common_setup()
 endif()
 
-# The StreamDiffusion object is deeply coupled to the ossia score stack: it stores
-# QImage / QByteArray members, parses controls through score's State::parseValue,
-# and pulls ctre / rapidhash / libossia headers that only the score build (or a
+# The StreamDiffusion object is deeply coupled to the ossia score stack: it parses
+# controls through score's State::parseValue, and pulls libossia headers that
+# only the score build (or a
 # full libossia checkout) provides. The pure-Avendish standalone back-ends
 # (pd / max / python / touchdesigner / godot) ship none of those, so the object
 # cannot be built there. Register it only when building against score; standalone
