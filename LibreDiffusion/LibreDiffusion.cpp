@@ -29,12 +29,11 @@
 #include <boost/fusion/include/adapt_struct.hpp>
 #include <boost/spirit/home/x3.hpp>
 #include <State/ValueParser.hpp>
-#include <QDebug>
-
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -584,10 +583,10 @@ void StreamDiffusion::blendTextures()
 
   const int byte_count = model_sz.width() * model_sz.height() * 4;
   if(inputs.feed_prev_in > 0 && inputs.feed_prev_out > 0
-     && m_prev_input.image.size() == model_sz && m_prev_output.image.size() == model_sz)
+     && m_prev_input.size() == model_sz && m_prev_output.size() == model_sz)
   {
-    const uint8_t* prev_input = (const uint8_t*)m_prev_input.storage.data();
-    const uint8_t* prev_output = (const uint8_t*)m_prev_output.storage.data();
+    const uint8_t* prev_input = (const uint8_t*)m_prev_input.constBits();
+    const uint8_t* prev_output = (const uint8_t*)m_prev_output.constBits();
     uint8_t* cur_input = m_cur_input.bits();
     float alpha = inputs.feed_prev_in;
     float beta = inputs.feed_prev_out;
@@ -617,9 +616,9 @@ void StreamDiffusion::blendTextures()
   else if(inputs.feed_prev_in > 0)
   {
     // Blend previous input
-    if(m_prev_input.image.size() == model_sz)
+    if(m_prev_input.size() == model_sz)
     {
-      const uint8_t* prev_input = (const uint8_t*)m_prev_input.storage.data();
+      const uint8_t* prev_input = (const uint8_t*)m_prev_input.constBits();
       uint8_t* cur_input = m_cur_input.bits();
       const int a = std::clamp(int(inputs.feed_prev_in * 256.f), 0, 256);
       const int c = 256 - a;
@@ -635,9 +634,9 @@ void StreamDiffusion::blendTextures()
   else if(inputs.feed_prev_out > 0)
   {
     // Blend previous input
-    if(m_prev_output.image.size() == model_sz)
+    if(m_prev_output.size() == model_sz)
     {
-      const uint8_t* prev_output = (const uint8_t*)m_prev_output.storage.data();
+      const uint8_t* prev_output = (const uint8_t*)m_prev_output.constBits();
       uint8_t* cur_input = m_cur_input.bits();
       const int a = std::clamp(int(inputs.feed_prev_out * 256.f), 0, 256);
       const int c = 256 - a;
@@ -750,7 +749,7 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
   }
   else
   {
-    qDebug() << "StreamDiffusion: keeping existing engine, will reinit buffers";
+    std::fprintf(stderr, "StreamDiffusion: keeping existing engine, will reinit buffers\n");
   }
 
   // Store configuration state (this is per-instance, not cached)
@@ -897,8 +896,8 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
   {
     if(!m_sd.config_add_controlnet)
     {
-      qDebug() << "StreamDiffusion: ControlNet requested but the librediffusion .so "
-                  "does not export config_add_controlnet";
+      std::fprintf(stderr, "StreamDiffusion: ControlNet requested but the librediffusion .so "
+                  "does not export config_add_controlnet\n");
       return false;
     }
     std::string controlnet_engine = in_config.model.value + "/controlnet.engine";
@@ -906,8 +905,8 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
         config.get(), controlnet_engine.c_str(), m_config_state.controlnet_scale);
     if(m_config_state.controlnet_index < 0)
     {
-      qDebug() << "StreamDiffusion: config_add_controlnet failed (missing "
-               << controlnet_engine.c_str() << "?)";
+      std::fprintf(stderr, "StreamDiffusion: config_add_controlnet failed (missing %s?)\n",
+               controlnet_engine.c_str());
       return false;
     }
   }
@@ -918,8 +917,8 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
   {
     if(!m_sd.config_set_ipadapter)
     {
-      qDebug() << "StreamDiffusion: IP-Adapter requested but the librediffusion .so "
-                  "does not export config_set_ipadapter";
+      std::fprintf(stderr, "StreamDiffusion: IP-Adapter requested but the librediffusion .so "
+                  "does not export config_set_ipadapter\n");
       return false;
     }
     m_sd.config_set_ipadapter(
@@ -1235,7 +1234,7 @@ bool StreamDiffusion::createKleinStream(const inputs_t& in_config)
       tok.c_str(), Th, Tw, seed};
   if (!m_klein_stream)
   {
-    qDebug() << "FLUX.2-klein: failed to create stream pipeline";
+    std::fprintf(stderr, "FLUX.2-klein: failed to create stream pipeline\n");
     return false;
   }
 
@@ -1247,7 +1246,7 @@ bool StreamDiffusion::createKleinStream(const inputs_t& in_config)
   std::array<float, 128> bn_mean{}, bn_std{};
   if (!load_klein_bn(model, bn_mean, bn_std))
   {
-    qDebug() << "FLUX.2-klein: missing bn_mean.bin/bn_std.bin (model folder or fallback)";
+    std::fprintf(stderr, "FLUX.2-klein: missing bn_mean.bin/bn_std.bin (model folder or fallback)\n");
     return false;
   }
   if (m_sd.flux2_stream_set_bn)
@@ -1430,7 +1429,7 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
 {
   if (!m_sd.available || !m_sd.flux2_stream_create)
   {
-    qDebug() << "FLUX.2-klein: library does not export the flux2 streaming API";
+    std::fprintf(stderr, "FLUX.2-klein: library does not export the flux2 streaming API\n");
     return;
   }
 
@@ -1498,7 +1497,7 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
                m_klein_stream.get(), in_config.prompt.value.c_str())
                < 0)
     {
-      qDebug() << "FLUX.2-klein: set_prompt failed";
+      std::fprintf(stderr, "FLUX.2-klein: set_prompt failed\n");
       return;
     }
     m_klein_prompt = in_config.prompt.value;
@@ -1536,9 +1535,9 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
       stopKleinProducer();
       if (mh != 0)
       {
-        QImage mimg(mt.bytes, mt.width, mt.height, QImage::Format_RGBA8888);
+        lo::rgba_image mimg(mt.bytes, mt.width, mt.height);
         if (mt.width != m_klein_w || mt.height != m_klein_h)
-          mimg = mimg.scaled(QSize(m_klein_w, m_klein_h), Qt::IgnoreAspectRatio, Qt::FastTransformation);
+          mimg = mimg.scaled({m_klein_w, m_klein_h});
         m_sd.flux2_stream_set_mask(m_klein_stream.get(), mimg.constBits(), m_klein_h, m_klein_w);
       }
       else
@@ -1597,11 +1596,11 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
         || !inputs.image.texture.bytes)
       return;
 
-    QImage in(
+    lo::rgba_image in(
         inputs.image.texture.bytes, inputs.image.texture.width,
-        inputs.image.texture.height, QImage::Format_RGBA8888);
+        inputs.image.texture.height);
     if (inputs.image.texture.width != w || inputs.image.texture.height != h)
-      in = in.scaled(QSize(w, h), Qt::IgnoreAspectRatio, Qt::FastTransformation);
+      in = in.scaled({w, h});
 
     const size_t bytes = std::min<size_t>((size_t)w * h * 4, in.sizeInBytes());
     std::memcpy(ref_frame.data(), in.constBits(), bytes);
@@ -1620,7 +1619,7 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
       if (m_sd.flux2_stream_set_reference(m_klein_stream.get(), ref_frame.data())
           != LIBREDIFFUSION_SUCCESS)
       {
-        qDebug() << "FLUX.2-klein: set_reference failed";
+        std::fprintf(stderr, "FLUX.2-klein: set_reference failed\n");
         return;
       }
       m_klein_ref_hash = rh;
@@ -1629,7 +1628,7 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
     auto err = m_sd.flux2_stream_frame_cached(m_klein_stream.get(), out_frame.data());
     if (err != LIBREDIFFUSION_SUCCESS)
     {
-      qDebug() << "FLUX.2-klein: stream_frame_cached failed" << (int)err;
+      std::fprintf(stderr, "FLUX.2-klein: stream_frame_cached failed %d\n", (int)err);
       return;
     }
   }
@@ -1640,7 +1639,7 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
         m_klein_stream.get(), ref_frame.data(), out_frame.data());
     if (err != LIBREDIFFUSION_SUCCESS)
     {
-      qDebug() << "FLUX.2-klein: stream_frame failed" << (int)err;
+      std::fprintf(stderr, "FLUX.2-klein: stream_frame failed %d\n", (int)err);
       return;
     }
   }
@@ -1805,11 +1804,11 @@ void StreamDiffusion::runKleinAsync(const inputs_t& in_config)
       have_input = false;
     else
     {
-      QImage in(
+      lo::rgba_image in(
           inputs.image.texture.bytes, inputs.image.texture.width,
-          inputs.image.texture.height, QImage::Format_RGBA8888);
+          inputs.image.texture.height);
       if (inputs.image.texture.width != w || inputs.image.texture.height != h)
-        in = in.scaled(QSize(w, h), Qt::IgnoreAspectRatio, Qt::FastTransformation);
+        in = in.scaled({w, h});
       std::memcpy(ref_frame.data(), in.constBits(), std::min<size_t>(nbytes, in.sizeInBytes()));
     }
   }
@@ -2102,7 +2101,7 @@ void StreamDiffusion::operator()()
   const int model_tex_h = in_config.size.value.y;
 
   unsigned char* input_tex_bytes{inputs.image.texture.bytes};
-  m_cur_input = QImage{};
+  m_cur_input = {};
 
   // Create output texture
   switch (this->inputs.workflow)
@@ -2133,17 +2132,16 @@ void StreamDiffusion::operator()()
         return;
       if(inputs.image.texture.height <= 0)
         return;
-      const auto model_sz = QSize(model_tex_w, model_tex_h);
+      const lo::image_size model_sz{model_tex_w, model_tex_h};
 
-      m_cur_input = QImage(
+      m_cur_input = lo::rgba_image(
           inputs.image.texture.bytes, inputs.image.texture.width,
-          inputs.image.texture.height, QImage::Format_RGBA8888);
+          inputs.image.texture.height);
 
       if(model_tex_w != inputs.image.texture.width
          || model_tex_h != inputs.image.texture.height)
       {
-        m_cur_input = m_cur_input.scaled(
-            model_sz, Qt::IgnoreAspectRatio, Qt::FastTransformation);
+        m_cur_input = m_cur_input.scaled(model_sz);
 
         input_tex_bytes = m_cur_input.bits();
       }
@@ -2167,7 +2165,7 @@ void StreamDiffusion::operator()()
   {
     bool ok = updatePromptEmbeddings(in_config.prompt.value, m_embeddings);
     if(!ok) {
-      qDebug("Invalid prompt");
+      std::fprintf(stderr, "Invalid prompt\n");
       return;
     }
   }
@@ -2176,7 +2174,7 @@ void StreamDiffusion::operator()()
   {
     bool ok = updatePromptEmbedding(in_config.negative_prompt.value, m_negative_embeddings);
     if(!ok) {
-      qDebug("Invalid negative prompt");
+      std::fprintf(stderr, "Invalid negative prompt\n");
       return;
     }
     m_sd.prepare_negative_embeds(m_cached_engine->pipeline->get(), m_negative_embeddings.embeddings,
@@ -2219,12 +2217,9 @@ void StreamDiffusion::operator()()
     const auto& ctl = in_config.control.texture;
     if(ctl.bytes && ctl.width > 0 && ctl.height > 0)
     {
-      QImage ctl_img(
-          ctl.bytes, ctl.width, ctl.height, QImage::Format_RGBA8888);
+      lo::rgba_image ctl_img(ctl.bytes, ctl.width, ctl.height);
       if(ctl.width != model_tex_w || ctl.height != model_tex_h)
-        ctl_img = ctl_img.scaled(
-            QSize(model_tex_w, model_tex_h), Qt::IgnoreAspectRatio,
-            Qt::FastTransformation);
+        ctl_img = ctl_img.scaled({model_tex_w, model_tex_h});
 
       m_sd.set_controlnet_cond_rgba(
           m_cached_engine->pipeline->get(), m_config_state.controlnet_index,
@@ -2234,8 +2229,8 @@ void StreamDiffusion::operator()()
     {
       // No control map this frame -> the controlnet engine would run on stale/zero
       // cond. Skip the frame rather than emit an unconditioned image.
-      qDebug() << "StreamDiffusion: ControlNet workflow but no control image on the "
-                  "'Control / Style' input";
+      std::fprintf(stderr, "StreamDiffusion: ControlNet workflow but no control image on the "
+                  "'Control / Style' input\n");
       return;
     }
   }
@@ -2274,8 +2269,8 @@ void StreamDiffusion::operator()()
       {
         // No style image yet and none ever set -> the IP-variant unet.engine would throw on
         // run (no tokens). Skip this frame rather than crash; the user must wire a style image.
-        qDebug() << "StreamDiffusion: IP-Adapter workflow but no style image on the "
-                    "'Control / Style' input";
+        std::fprintf(stderr, "StreamDiffusion: IP-Adapter workflow but no style image on the "
+                    "'Control / Style' input\n");
         return;
       }
     }
@@ -2333,34 +2328,13 @@ void StreamDiffusion::operator()()
             outputs.image.texture.bytes, model_tex_w, model_tex_h);
         if(inputs.feed_prev_in > 0)
         {
-#if QT_VERSION > QT_VERSION_CHECK(6, 6, 0)
-          m_prev_input.storage.assign(
-              (const char*)input_tex_bytes,
-              (const char*)input_tex_bytes + m_cur_input.sizeInBytes());
-#else
-          m_prev_input.storage.clear();
-          m_prev_input.storage.insert(
-              0, (const char*)input_tex_bytes, m_cur_input.sizeInBytes());
-#endif
-          m_prev_input.image = QImage(
-              (unsigned char*)m_prev_input.storage.data(), model_tex_w, model_tex_h,
-              QImage::Format_RGBA8888);
+          m_prev_input = lo::rgba_image(input_tex_bytes, model_tex_w, model_tex_h);
         }
 
         if(inputs.feed_prev_out > 0)
         {
-#if QT_VERSION > QT_VERSION_CHECK(6, 6, 0)
-          m_prev_output.storage.assign(
-              (const char*)outputs.image.texture.bytes,
-              (const char*)outputs.image.texture.bytes + m_cur_input.sizeInBytes());
-#else
-          m_prev_output.storage.clear();
-          m_prev_output.storage.insert(
-              0, (const char*)outputs.image.texture.bytes, m_cur_input.sizeInBytes());
-#endif
-          m_prev_output.image = QImage(
-              (unsigned char*)m_prev_output.storage.data(), model_tex_w, model_tex_h,
-              QImage::Format_RGBA8888);
+          m_prev_output = lo::rgba_image(
+              outputs.image.texture.bytes, model_tex_w, model_tex_h);
         }
       }
       break;

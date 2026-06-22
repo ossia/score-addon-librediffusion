@@ -6,7 +6,7 @@
 #include <ossia/detail/triple_buffer.hpp>
 #include <ossia/detail/variant.hpp>
 
-#include <QImage>
+#include "Image.hpp"
 
 #include <halp/buffer.hpp>
 #include <halp/controls.hpp>
@@ -513,16 +513,10 @@ private:
   int m_sd_async_exp{-1};                       // last exp submitted (change detect)
   double m_sd_last_tick_t{0.0};                 // wall time of previous async tick (render dt)
 
-  struct Image
-  {
-    QByteArray storage;
-    QImage image;
-  };
-
-  Image m_prev_input;
-  QImage m_ext_input;
-  QImage m_cur_input;
-  Image m_prev_output;
+  lo::rgba_image m_prev_input;
+  lo::rgba_image m_ext_input;
+  lo::rgba_image m_cur_input;
+  lo::rgba_image m_prev_output;
 };
 
 }

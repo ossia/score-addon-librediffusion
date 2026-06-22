@@ -1,6 +1,5 @@
 #include "EngineCache.hpp"
 #include "LibreDiffusion.hpp"
-#include <QDebug>
 
 namespace lo
 {
