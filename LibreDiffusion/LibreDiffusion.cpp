@@ -12,15 +12,10 @@
 #include <ossia/detail/fmt.hpp>
 #include <boost/container/small_vector.hpp>
 
-// ctre / rapidhash are libossia 3rdparty single-headers. Use the host's copy
-// when it is on the include path (score dev build), otherwise the vendored copy
-// so SDK / JIT / standalone builds -- which do not expose libossia's 3rdparty
-// include dirs -- still compile.
-#if __has_include(<ctre.hpp>)
-#include <ctre.hpp>
-#else
-#include "compat/ctre.hpp"
-#endif
+// rapidhash is a libossia 3rdparty single-header. Use the host's copy when it
+// is on the include path (score dev build), otherwise the vendored copy so SDK
+// / JIT / standalone builds -- which do not expose libossia's 3rdparty include
+// dirs -- still compile.
 #if __has_include(<rapidhash.h>)
 #include <rapidhash.h>
 #else
@@ -28,12 +23,12 @@
 #endif
 #include <boost/fusion/include/adapt_struct.hpp>
 #include <boost/spirit/home/x3.hpp>
-#include <State/ValueParser.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -118,56 +113,41 @@ parse_input_string(std::string_view str)
 
 namespace lo
 {
-static constexpr auto all_numbers = ctre::search_all<"\\d+">;
-
 static std::vector<int> get_steps(std::string s)
 {
+  auto ws = [](unsigned char c){ return c==' '||c=='\t'||c=='\n'||c=='\r'; };
+  std::size_t b = 0, e = s.size();
+  while(b < e && ws(s[b])) ++b;
+  while(e > b && ws(s[e-1])) --e;
+  s = s.substr(b, e - b);
   if(s.empty())
     return {};
 
-  int start = 0;
-  for(; start < s.size(); start++) {
-    if(s[start] == ' ' || s[start] == '\t' || s[start] == '\n')
-      continue;
-    break;
-  }
-  int end = s.size() - 1;
-  for(; end > start; end--) {
-    if(s[end] == ' ' || s[end] == '\t' || s[end] == '\n')
-      continue;
-    break;
-  }
-
-  s = s.substr(start, end - start + 1);
-  if(s.empty())
-    return {};
-  if(s.contains(',') && !s.starts_with('[')) {
-    s.insert(s.begin(), '[');
-    s.insert(s.end() - 1, ']');
-  }
-
-  if(auto v = State::parseValue(s))
-  {
-    if(auto value = v->target<int>())
-      return {std::clamp(*value, 0, 49)};
-    else if(auto value = v->target<float>())
-      return {std::clamp((int)*value, 0, 49)};
-    else if(auto value = v->target<std::vector<ossia::value>>()) {
-      std::vector<int> res;
-      for(auto& val : *value) {
-        res.push_back(std::clamp(ossia::convert<int>(val), 0, 49));
-      }
-      return res;
-    }
-  }
-
-  auto view = all_numbers(s) | std::views::transform([](auto&& match) {
-    return std::clamp(match.to_number(10), 0, 49);
-  });
+  if(s.front() == '[' && s.back() == ']') // tolerate "[a, b]"
+    s = s.substr(1, s.size() - 2);
 
   std::vector<int> result;
   result.reserve(4);
-  std::ranges::copy(view, std::back_inserter(result));
+  std::size_t pos = 0;
+  while(true)
+  {
+    std::size_t comma = s.find(',', pos);
+    std::size_t tend = (comma == std::string::npos) ? s.size() : comma;
+    std::size_t tb = pos, te = tend;
+    while(tb < te && ws(s[tb])) ++tb;
+    while(te > tb && ws(s[te-1])) --te;
+    if(te > tb)
+    {
+      std::string tok = s.substr(tb, te - tb);   // null-terminated for strtod
+      char* parse_end = nullptr;
+      double d = std::strtod(tok.c_str(), &parse_end);
+      if(parse_end != tok.c_str())               // parsed at least one digit
+        result.push_back(std::clamp(static_cast<int>(d), 0, 49));
+    }
+    if(comma == std::string::npos)
+      break;
+    pos = comma + 1;
+  }
   return result;
 }
 
