@@ -12,8 +12,20 @@
 #include <ossia/detail/fmt.hpp>
 #include <boost/container/small_vector.hpp>
 
+// ctre / rapidhash are libossia 3rdparty single-headers. Use the host's copy
+// when it is on the include path (score dev build), otherwise the vendored copy
+// so SDK / JIT / standalone builds -- which do not expose libossia's 3rdparty
+// include dirs -- still compile.
+#if __has_include(<ctre.hpp>)
 #include <ctre.hpp>
+#else
+#include "compat/ctre.hpp"
+#endif
+#if __has_include(<rapidhash.h>)
 #include <rapidhash.h>
+#else
+#include "compat/rapidhash.h"
+#endif
 #include <boost/fusion/include/adapt_struct.hpp>
 #include <boost/spirit/home/x3.hpp>
 #include <State/ValueParser.hpp>
