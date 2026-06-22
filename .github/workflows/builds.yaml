@@ -21,6 +21,18 @@ jobs:
     with:
       targets: "linux/x86_64 windows/x86_64"
 
-  # TODO: a standalone back-end artifact job (avnd-addon.yml) for the same two
-  # targets. The object now builds standalone (no Qt, no score parser, runtime
-  # dynamic-load), so this is wiring -- pending.
+  # Standalone back-end artifacts for the same two Nvidia-desktop targets. The
+  # object now builds standalone (no Qt, no score parser, runtime dynamic-load),
+  # so ship the texture-appropriate back-ends. avnd-addon.yml filters each
+  # back-end's matrix by `targets`, dropping macOS (no Nvidia path) -- so e.g.
+  # gstreamer lands on linux, touchdesigner/max on windows, godot/python on both.
+  standalone:
+    uses: ossia/actions/.github/workflows/avnd-addon.yml@master
+    secrets: inherit
+    with:
+      targets: "linux/x86_64 windows/x86_64"
+      max: true
+      godot: true
+      touchdesigner: true
+      gstreamer: true
+      python: true
