@@ -53,11 +53,18 @@ target_include_directories(librediffusion_deps INTERFACE
 
 # Standalone back-ends emitted for the object. Ignored in a score build (score
 # introspects the object directly); only the standalone / portability back-ends
-# consume this list.
-set(LO_STANDALONE_BACKENDS dump ossia standalone)
-if(NOT EMSCRIPTEN)
-  list(APPEND LO_STANDALONE_BACKENDS godot:NODE)
-endif()
+# consume this list. StreamDiffusion is an image/texture processor, so we emit
+# the texture-appropriate set (cf. avendish's avnd_make_texture preset): max
+# (Jitter matrix), gstreamer/touchdesigner/godot as texture filters, plus python.
+# `dump` is a headless canary that keeps the object compiling in the portability
+# smoke, where the SDK-backed back-ends are gated off.
+set(LO_STANDALONE_BACKENDS
+  dump
+  python
+  max
+  gstreamer:TEXTURE
+  touchdesigner:TOP
+  godot:TEXTURE)
 
 avnd_addon_init(NAME score_addon_librediffusion)
 
