@@ -26,7 +26,7 @@
 // producer first (drain), exactly as the klein path does around set_prompt / createConfiguration.
 // ---------------------------------------------------------------------------------------------------
 
-#include <ossia/detail/triple_buffer.hpp>
+#include "compat/triple_buffer.hpp"
 
 #include <atomic>
 #include <condition_variable>
