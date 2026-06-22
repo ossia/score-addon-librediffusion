@@ -11,13 +11,16 @@ concurrency:
 
 jobs:
   # Build + package the score add-on (dev / SDK / JIT / release tracks).
+  # Restricted to linux/x86_64 + windows/x86_64: the StreamDiffusion object loads
+  # the librediffusion runtime (CUDA / TensorRT) at run time, so it is only useful
+  # on Nvidia desktops. macOS has no Nvidia path in any configuration, so it is
+  # excluded here (and via the CMake macOS early-return).
   score:
     uses: ossia/actions/.github/workflows/score-addon.yml@master
     secrets: inherit
+    with:
+      targets: "linux/x86_64 windows/x86_64"
 
-  # No standalone job: the StreamDiffusion object is score-only. It links
-  # CUDA + TensorRT (desktop-only) and is coupled to the ossia score stack --
-  # QImage/QByteArray members, score's State::parseValue, and ctre/rapidhash/
-  # libossia headers the pure-Avendish back-ends don't ship. CMake registers
-  # the object only against score, so a standalone configure would build nothing
-  # and the avnd-addon packaging step would have no artifact to publish.
+  # TODO: a standalone back-end artifact job (avnd-addon.yml) for the same two
+  # targets. The object now builds standalone (no Qt, no score parser, runtime
+  # dynamic-load), so this is wiring -- pending.
