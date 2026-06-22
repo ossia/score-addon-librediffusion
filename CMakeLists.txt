@@ -36,27 +36,39 @@ if(COMMAND score_common_setup)
   score_common_setup()
 endif()
 
-# The StreamDiffusion object is deeply coupled to the ossia score stack: it parses
-# controls through score's State::parseValue, and pulls libossia headers that
-# only the score build (or a
-# full libossia checkout) provides. The pure-Avendish standalone back-ends
-# (pd / max / python / touchdesigner / godot) ship none of those, so the object
-# cannot be built there. Register it only when building against score; standalone
-# configures to a clean no-op (the addon then ships nothing, as intended).
-if(TARGET score_plugin_avnd OR COMMAND avnd_score_plugin_add)
-  add_library(librediffusion_deps INTERFACE)
-  target_include_directories(librediffusion_deps INTERFACE 3rdparty/librediffusion/src)
+# The StreamDiffusion object loads the librediffusion runtime through its C API
+# by dynamic loading, so it needs no CUDA/TensorRT at build time -- only the C
+# API header below. The sources have no hard score dependency: the one ossia
+# include (ossia/detail/fmt) is __has_include-guarded, rapidhash/triple_buffer
+# are vendored, and control parsing is a self-contained strtod scan. So the
+# object compiles identically against score and standalone; at runtime it simply
+# no-ops when the librediffusion shared library is absent (e.g. a non-CUDA host).
+add_library(librediffusion_deps INTERFACE)
+# 3rdparty/librediffusion/src: the StreamDiffusion C API header.
+# CMAKE_CURRENT_SOURCE_DIR: the addon root, so the generated standalone back-end
+# wrappers can resolve their <LibreDiffusion/LibreDiffusion.hpp> include.
+target_include_directories(librediffusion_deps INTERFACE
+  3rdparty/librediffusion/src
+  "${CMAKE_CURRENT_SOURCE_DIR}")
 
-  avnd_addon_init(NAME score_addon_librediffusion)
-
-  avnd_addon_object(
-    BASE score_addon_librediffusion C_NAME streamdiffusion CLASS StreamDiffusion NAMESPACE lo
-    DEPENDENCIES librediffusion_deps
-    SOURCES
-      LibreDiffusion/LibreDiffusion.hpp
-      LibreDiffusion/LibreDiffusion.cpp
-      LibreDiffusion/EngineCache.hpp
-      LibreDiffusion/EngineCache.cpp)
-
-  avnd_addon_finalize(NAME score_addon_librediffusion UUID b3fe4d80-0a1a-4b23-8cd2-b82472f9f91f VERSION 1)
+# Standalone back-ends emitted for the object. Ignored in a score build (score
+# introspects the object directly); only the standalone / portability back-ends
+# consume this list.
+set(LO_STANDALONE_BACKENDS dump ossia standalone)
+if(NOT EMSCRIPTEN)
+  list(APPEND LO_STANDALONE_BACKENDS godot:NODE)
 endif()
+
+avnd_addon_init(NAME score_addon_librediffusion)
+
+avnd_addon_object(
+  BASE score_addon_librediffusion C_NAME streamdiffusion CLASS StreamDiffusion NAMESPACE lo
+  DEPENDENCIES librediffusion_deps
+  BACKENDS ${LO_STANDALONE_BACKENDS}
+  SOURCES
+    LibreDiffusion/LibreDiffusion.hpp
+    LibreDiffusion/LibreDiffusion.cpp
+    LibreDiffusion/EngineCache.hpp
+    LibreDiffusion/EngineCache.cpp)
+
+avnd_addon_finalize(NAME score_addon_librediffusion UUID b3fe4d80-0a1a-4b23-8cd2-b82472f9f91f VERSION 1)
