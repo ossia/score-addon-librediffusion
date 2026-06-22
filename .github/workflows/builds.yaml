@@ -15,16 +15,9 @@ jobs:
     uses: ossia/actions/.github/workflows/score-addon.yml@master
     secrets: inherit
 
-  # Build the same object(s) standalone, one artifact per back-end.
-  # ML / inference object: the StreamDiffusion engine links CUDA + TensorRT,
-  # so the object is desktop-only (win/linux) and CMake returns early elsewhere.
-  # wasm omitted: no WebAssembly CUDA/TensorRT build.
-  standalone:
-    uses: ossia/actions/.github/workflows/avnd-addon.yml@master
-    secrets: inherit
-    with:
-      pd: true
-      max: true
-      python: true
-      touchdesigner: true
-      godot: true
+  # No standalone job: the StreamDiffusion object is score-only. It links
+  # CUDA + TensorRT (desktop-only) and is coupled to the ossia score stack --
+  # QImage/QByteArray members, score's State::parseValue, and ctre/rapidhash/
+  # libossia headers the pure-Avendish back-ends don't ship. CMake registers
+  # the object only against score, so a standalone configure would build nothing
+  # and the avnd-addon packaging step would have no artifact to publish.

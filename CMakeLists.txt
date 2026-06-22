@@ -32,18 +32,27 @@ if(COMMAND score_common_setup)
   score_common_setup()
 endif()
 
-add_library(librediffusion_deps INTERFACE)
-target_include_directories(librediffusion_deps INTERFACE 3rdparty/librediffusion/src)
+# The StreamDiffusion object is deeply coupled to the ossia score stack: it stores
+# QImage / QByteArray members, parses controls through score's State::parseValue,
+# and pulls ctre / rapidhash / libossia headers that only the score build (or a
+# full libossia checkout) provides. The pure-Avendish standalone back-ends
+# (pd / max / python / touchdesigner / godot) ship none of those, so the object
+# cannot be built there. Register it only when building against score; standalone
+# configures to a clean no-op (the addon then ships nothing, as intended).
+if(TARGET score_plugin_avnd OR COMMAND avnd_score_plugin_add)
+  add_library(librediffusion_deps INTERFACE)
+  target_include_directories(librediffusion_deps INTERFACE 3rdparty/librediffusion/src)
 
-avnd_addon_init(NAME score_addon_librediffusion)
+  avnd_addon_init(NAME score_addon_librediffusion)
 
-avnd_addon_object(
-  BASE score_addon_librediffusion C_NAME streamdiffusion CLASS StreamDiffusion NAMESPACE lo
-  DEPENDENCIES librediffusion_deps
-  SOURCES
-    LibreDiffusion/LibreDiffusion.hpp
-    LibreDiffusion/LibreDiffusion.cpp
-    LibreDiffusion/EngineCache.hpp
-    LibreDiffusion/EngineCache.cpp)
+  avnd_addon_object(
+    BASE score_addon_librediffusion C_NAME streamdiffusion CLASS StreamDiffusion NAMESPACE lo
+    DEPENDENCIES librediffusion_deps
+    SOURCES
+      LibreDiffusion/LibreDiffusion.hpp
+      LibreDiffusion/LibreDiffusion.cpp
+      LibreDiffusion/EngineCache.hpp
+      LibreDiffusion/EngineCache.cpp)
 
-avnd_addon_finalize(NAME score_addon_librediffusion UUID b3fe4d80-0a1a-4b23-8cd2-b82472f9f91f VERSION 1)
+  avnd_addon_finalize(NAME score_addon_librediffusion UUID b3fe4d80-0a1a-4b23-8cd2-b82472f9f91f VERSION 1)
+endif()
