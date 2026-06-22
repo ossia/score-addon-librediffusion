@@ -17,3 +17,6 @@ jobs:
       # iOS off: Xcode multi-config plumbing fails and iOS isn't a meaningful
       # target. The other 20 lanes cover the portability surface.
       ios: false
+      # macOS off: librediffusion needs an Nvidia GPU (CUDA / TensorRT) at run
+      # time, which macOS never has -- it can't work there in any configuration.
+      macos: false
