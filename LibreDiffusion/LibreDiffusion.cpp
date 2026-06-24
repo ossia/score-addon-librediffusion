@@ -2255,6 +2255,21 @@ void StreamDiffusion::operator()()
     }
   }
 
+  // Runtime LoRA: if the loaded UNet engine declares lora_scale[N] (exported with --lora PATH:runtime),
+  // drive its strength live from the "LoRA scale" knob (uniform across all slots). Change-gated; a no-op
+  // for engines without the input (num_runtime_loras == 0).
+  if(m_sd.num_runtime_loras && m_sd.set_lora_scale
+     && in_config.lora_scale != m_config_state.lora_scale)
+  {
+    const int nl = m_sd.num_runtime_loras(m_cached_engine->pipeline->get());
+    if(nl > 0)
+    {
+      m_config_state.lora_scale = in_config.lora_scale;
+      for(int i = 0; i < nl; i++)
+        m_sd.set_lora_scale(m_cached_engine->pipeline->get(), i, m_config_state.lora_scale);
+    }
+  }
+
   // Async (option A): for plain SD/SDXL txt2img/img2img, diffuse on a background producer thread
   // (it blocks on the pipeline's own CUDA stream) and present steady-clock-paced frames here, so a
   // slow model (e.g. SDXL @1024 ~10fps) never stalls the score tick and RIFE can fill between
