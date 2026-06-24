@@ -26,6 +26,12 @@
 // producer first (drain), exactly as the klein path does around set_prompt / createConfiguration.
 // ---------------------------------------------------------------------------------------------------
 
+// triple_buffer is the lock-free producer->consumer hand-off. Always use the
+// vendored copy: it is API-compatible with ossia::triple_buffer but self-
+// contained, so this compiles in every mode -- standalone (no libossia) and,
+// crucially, against the score SDK, whose bundled ossia/detail/triple_buffer.hpp
+// is an older revision that misses <utility> and fails to build. No score
+// header included by this object pulls the ossia copy, so there is no clash.
 #include "compat/triple_buffer.hpp"
 
 #include <atomic>
