@@ -2,9 +2,8 @@
 #include "AsyncFrameProducer.hpp"
 #include "librediffusion_loader.hpp"
 
-#include <ossia/detail/lockfree_queue.hpp>
-#include <ossia/detail/triple_buffer.hpp>
-#include <ossia/detail/variant.hpp>
+// triple_buffer pulled in transitively via AsyncFrameProducer.hpp above, which
+// already selects the ossia header or the vendored standalone copy.
 
 #include "Image.hpp"
 

@@ -9,7 +9,9 @@
 #include "schedulers/sd-turbo.hpp"
 #include "schedulers/sdxl-turbo.hpp"
 
+#if __has_include(<ossia/detail/fmt.hpp>)
 #include <ossia/detail/fmt.hpp>
+#endif
 #include <boost/container/small_vector.hpp>
 
 // rapidhash is a libossia 3rdparty single-header. Use the host's copy when it
@@ -122,12 +124,10 @@ static std::vector<int> get_steps(std::string s)
   s = s.substr(b, e - b);
   if(s.empty())
     return {};
-
-  if(s.front() == '[' && s.back() == ']') // tolerate "[a, b]"
+  if(s.front() == '[' && s.back() == ']')   // tolerate "[a, b]"
     s = s.substr(1, s.size() - 2);
 
   std::vector<int> result;
-  result.reserve(4);
   std::size_t pos = 0;
   while(true)
   {
@@ -1675,7 +1675,7 @@ void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
 {
   if (!m_sd.available || !m_sd.img2img_turbo_create || !m_sd.img2img_turbo_frame)
   {
-    qDebug() << "img2img-turbo: library does not export the img2img-turbo API";
+    std::fprintf(stderr, "img2img-turbo: library does not export the img2img-turbo API\n");
     return;
   }
 
@@ -1692,7 +1692,7 @@ void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
     m_i2it_model_path = in_config.model.value;
     if (!m_i2it)
     {
-      qDebug() << "img2img-turbo: create failed for" << in_config.model.value.c_str();
+      std::fprintf(stderr, "img2img-turbo: create failed for %s\n", in_config.model.value.c_str());
       return;
     }
     // CLIP encoder so the embedding can be derived from the Prompt (sd-turbo, pad 0, dim 1024).
@@ -1719,11 +1719,10 @@ void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
       || !inputs.image.texture.bytes)
     return;
   m_i2it_in.assign((size_t)w * h * 4, 0);
-  QImage in(
-      inputs.image.texture.bytes, inputs.image.texture.width, inputs.image.texture.height,
-      QImage::Format_RGBA8888);
+  lo::rgba_image in(
+      inputs.image.texture.bytes, inputs.image.texture.width, inputs.image.texture.height);
   if (inputs.image.texture.width != w || inputs.image.texture.height != h)
-    in = in.scaled(QSize(w, h), Qt::IgnoreAspectRatio, Qt::FastTransformation);
+    in = in.scaled({w, h});
   std::memcpy(
       m_i2it_in.data(), in.constBits(), std::min<size_t>((size_t)w * h * 4, in.sizeInBytes()));
 
@@ -1747,7 +1746,7 @@ void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
   }
   if (err != LIBREDIFFUSION_SUCCESS)
   {
-    qDebug() << "img2img-turbo: frame failed" << (int)err;
+    std::fprintf(stderr, "img2img-turbo: frame failed %d\n", (int)err);
     return;
   }
 
