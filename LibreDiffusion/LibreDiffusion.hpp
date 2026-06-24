@@ -206,6 +206,9 @@ struct SDConfigState
   // set_ipadapter_image, so we only re-encode when the "Control / Style" texture changes.
   uint64_t ipadapter_style_hash{0};
   bool ipadapter_image_set{false};
+  // Runtime LoRA: the loaded UNet engine declares lora_scale[N] (engines exported with PATH:runtime).
+  // Last applied uniform scale (so we only push on change).
+  float lora_scale{1.0f};
 };
 
 /**
@@ -356,6 +359,14 @@ public:
     {
       halp_meta(description, "IP-Adapter style strength (IP-variant unet.engine required)")
     } ipadapter_scale;
+
+    // Runtime LoRA strength: live-adjustable when the engine was exported with --lora PATH:runtime
+    // (UNet declares a lora_scale input). 1 = LoRA fully on (== a baked engine), 0 = off. Applied
+    // uniformly to all runtime-LoRA slots; ignored by engines without a lora_scale input.
+    struct : halp::knob_f32<"LoRA scale", halp::range{0.0, 2.0, 1.0}>
+    {
+      halp_meta(description, "Runtime LoRA strength (engine exported with --lora PATH:runtime)")
+    } lora_scale;
 
     // FLUX.2-klein only: which transformer engine to load (fidelity vs speed)
     struct : halp::enum_t<KleinQuality, "Klein quality">
