@@ -297,9 +297,11 @@ public:
 
     struct : halp::lineedit<"Prompt +", "mushroom kingdom, charcoal, velvia">
     {
+      halp_meta(c_name, "prompt_positive")
     } prompt;
     struct : halp::lineedit<"Prompt -", "anime">
     {
+      halp_meta(c_name, "prompt_negative")
     } negative_prompt;
     struct : halp::lineedit<"Engines", "">
     {
