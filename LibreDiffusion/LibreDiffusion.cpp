@@ -1133,18 +1133,32 @@ bool StreamDiffusion::updatePromptEmbeddings(const std::string& prompt, std::vec
     for (const auto& [k, v] : *weights)
     {
       SDXLEmbeddings e;
-      updatePromptEmbedding(k, e);
+      // A failed sub-prompt encode used to be IGNORED: its null device pointer went straight
+      // into the array handed to blend_embeds, which does not null-check its elements -> an
+      // illegal device access that kills the CUDA context for the whole process. Propagate it.
+      if (!updatePromptEmbedding(k, e) || !e.embeddings)
+      {
+        embeddings.clear();
+        return false;
+      }
       bembeds.push_back(e.embeddings);
       embeddings.push_back(std::move(e));
       bweight.push_back(v);
     }
+
+    if (bembeds.empty())
+      return false;
 
     m_sd.blend_embeds(m_cached_engine->pipeline->get(), bembeds.data(), bweight.data(), bembeds.size(), m_config_state.text_seq_len, m_config_state.text_hidden_dim);
   }
   else
   {
     SDXLEmbeddings e;
-    updatePromptEmbedding(prompt, e);
+    if (!updatePromptEmbedding(prompt, e) || !e.embeddings)
+    {
+      embeddings.clear();
+      return false;
+    }
     embeddings.push_back(std::move(e));
 
     m_sd.prepare_embeds(m_cached_engine->pipeline->get(), embeddings.front().embeddings,
