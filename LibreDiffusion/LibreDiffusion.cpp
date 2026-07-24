@@ -812,6 +812,27 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
     std::fprintf(stderr, "StreamDiffusion: keeping existing engine, will reinit buffers\n");
   }
 
+  // The second CLIP encoder used to be built ONLY in the branch above, i.e. only when this node
+  // was the one that created the cache entry. The EngineCache key is (model path, pipeline mode)
+  // and SD / SDXL / ControlNet / IP-Adapter all share MODE_SINGLE_FRAME, so an entry created by
+  // an SD workflow could never grow the clip2 an SDXL workflow needs: it stayed null forever,
+  // updatePromptEmbedding returned false, and the node rendered NOTHING for as long as the
+  // folder was selected (recoverable only by switching back to SD). Build it on demand instead,
+  // which also keeps the switch cheap -- the expensive UNet/VAE engines are still reused.
+  if (model_type == MODEL_SDXL_TURBO && m_cached_engine && !m_cached_engine->clip2)
+  {
+    std::string clip2_path = in_config.model.value + "/clip2.engine";
+    auto* clip2 = new SDClip{clip2_path.c_str()};
+    if (!*clip2)
+    {
+      std::fprintf(stderr, "StreamDiffusion: SDXL workflow but %s could not be loaded\n",
+                   clip2_path.c_str());
+      delete clip2;
+      return false;
+    }
+    m_cached_engine->clip2 = clip2;
+  }
+
   // Store configuration state (this is per-instance, not cached)
   m_config_state.model_type = model_type;
   m_config_state.pipeline_mode = pipeline_mode;
