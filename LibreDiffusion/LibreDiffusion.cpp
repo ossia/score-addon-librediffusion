@@ -57,6 +57,14 @@ inline bool file_exists(const std::string& p) noexcept
   std::error_code ec;
   return std::filesystem::exists(p, ec) && !ec;
 }
+
+// Upper bound for the Resolution port. The spinbox range is 64..2048, but a preset, an
+// automation curve or a remote parameter can deliver anything, and nothing downstream is
+// bounded: halp's texture create() computes `width * height * bytes_per_pixel` with the
+// width*height product in `int` (50000^2 overflows to a negative -> a huge size_t ->
+// length_error out of operator()), while 40000^2 does NOT overflow and simply commits 6.4 GB.
+// 8192 is far above any diffusion model and still only 268 MB per host frame buffer.
+constexpr int k_max_resolution = 8192;
 }
 
 // Prompt interpolation
@@ -569,6 +577,32 @@ bool StreamDiffusion::is_available() noexcept
   return sd::liblibrediffusion::instance().available;
 }
 
+// Validate + clamp the Resolution port before ANY of it reaches a buffer allocation or the
+// library. Returns false when the request cannot be honoured at all (a non-positive or
+// inconsistent dimension), in which case the caller must skip the frame: (-1,-1) used to sail
+// through because create() computes (-1)*(-1)*4 == 4, allocating a four-byte texture and then
+// calling txt2img(..., -1, -1). Diagnoses once per distinct bad value, not once per tick.
+bool StreamDiffusion::resolveResolution(const inputs_t& in, int& w, int& h)
+{
+  const int rw = in.size.value.x;
+  const int rh = in.size.value.y;
+  const bool usable = (rw > 0 && rh > 0);
+
+  w = usable ? std::min(rw, k_max_resolution) : rw;
+  h = usable ? std::min(rh, k_max_resolution) : rh;
+
+  if((!usable || w != rw || h != rh)
+     && (rw != m_reported_size_w || rh != m_reported_size_h))
+  {
+    m_reported_size_w = rw;
+    m_reported_size_h = rh;
+    std::fprintf(
+        stderr, "StreamDiffusion: Resolution %dx%d is out of range (1..%d) -- %s\n", rw, rh,
+        k_max_resolution, usable ? "clamped" : "frame skipped");
+  }
+  return usable;
+}
+
 void StreamDiffusion::blendTextures()
 {
   const auto model_sz = m_cur_input.size();
@@ -648,8 +682,9 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
   if (!m_sd.available)
     return false;
 
-  auto width = in_config.size.value.x;
-  auto height = in_config.size.value.y;
+  int width = 0, height = 0;
+  if (!resolveResolution(in_config, width, height))
+    return false;
 
   if (timestep_indices.empty())
     return false;
@@ -1195,8 +1230,11 @@ bool StreamDiffusion::createKleinStream(const inputs_t& in_config)
 
   // Resolution -> packed token grid. H = Th*16, W = Tw*16.
   // Round to multiples of 16 (the klein patch+VAE stride).
-  int w = std::max(16, (in_config.size.value.x / 16) * 16);
-  int h = std::max(16, (in_config.size.value.y / 16) * 16);
+  int w = 0, h = 0;
+  if (!resolveResolution(in_config, w, h))
+    return false;
+  w = std::max(16, (w / 16) * 16);
+  h = std::max(16, (h / 16) * 16);
   const int Tw = w / 16;
   const int Th = h / 16;
 
@@ -1425,8 +1463,11 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
     return;
   }
 
-  int w = std::max(16, (in_config.size.value.x / 16) * 16);
-  int h = std::max(16, (in_config.size.value.y / 16) * 16);
+  int w = 0, h = 0;
+  if (!resolveResolution(in_config, w, h))
+    return;
+  w = std::max(16, (w / 16) * 16);
+  h = std::max(16, (h / 16) * 16);
   const int quality = static_cast<int>(in_config.klein_quality.value);
 
   // (Re)create the stream pipeline when the model / resolution / quality changes.
@@ -2097,8 +2138,11 @@ void StreamDiffusion::operator()()
   if (!m_cached_engine || !m_cached_engine->pipeline)
     return;
 
-  const int model_tex_w = in_config.size.value.x;
-  const int model_tex_h = in_config.size.value.y;
+  // Already validated at the top of operator(); recomputed here so every downstream buffer
+  // allocation and library call uses the CLAMPED value, never the raw port.
+  int model_tex_w = 0, model_tex_h = 0;
+  if (!resolveResolution(in_config, model_tex_w, model_tex_h))
+    return;
 
   unsigned char* input_tex_bytes{inputs.image.texture.bytes};
   m_cur_input = {};
@@ -2331,8 +2375,8 @@ void StreamDiffusion::operator()()
     case Workflow::V2V_TXT2IMG:
       m_sd.txt2img(m_cached_engine->pipeline->get(),
                    outputs.image.texture.bytes,
-                   in_config.size.value.x,
-                   in_config.size.value.y);
+                   model_tex_w,
+                   model_tex_h);
       break;
 
     case Workflow::SD_IMG2IMG:

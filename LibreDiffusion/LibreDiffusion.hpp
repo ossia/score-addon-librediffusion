@@ -440,6 +440,12 @@ private:
 
   inputs_t m_prev_inputs{};
 
+  // Validate + clamp the Resolution port (positive, <= k_max_resolution). Returns false when the
+  // request cannot be honoured at all, in which case the frame must be skipped.
+  bool resolveResolution(const inputs_t& in_config, int& w, int& h);
+  int m_reported_size_w{0};   // last diagnosed bad Resolution (report once, not once per tick)
+  int m_reported_size_h{0};
+
   bool createConfiguration(const inputs_t& in_config, const std::vector<int>& timestep_indices);
   bool updatePromptEmbedding(const std::string& prompt, SDXLEmbeddings& embeddings);
   bool updatePromptEmbeddings(const std::string& prompt, std::vector<SDXLEmbeddings>& embeddings);
