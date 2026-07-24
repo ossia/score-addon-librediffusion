@@ -577,6 +577,39 @@ bool StreamDiffusion::is_available() noexcept
   return sd::liblibrediffusion::instance().available;
 }
 
+// N-02: the input set that decides whether the setup can succeed at all.
+StreamDiffusion::SetupKey StreamDiffusion::setupKey(const inputs_t& in)
+{
+  SetupKey k;
+  k.model = in.model.value;
+  k.prompt = in.prompt.value;
+  k.negative_prompt = in.negative_prompt.value;
+  k.timesteps = in.t1.value;
+  k.width = in.size.value.x;
+  k.height = in.size.value.y;
+  k.workflow = in.workflow.value;
+  k.cfg = in.cfg.value;
+  k.klein_quality = in.klein_quality.value;
+  k.add_noise = in.add_noise.value;
+  k.denoise_batch = in.denoise_batch.value;
+  k.valid = true;
+  return k;
+}
+
+// `m_prev_inputs = inputs` is only reached on SUCCESS, so before this guard a failing
+// configuration (bad folder, wrong bundle, unparseable timesteps) re-attempted a full engine
+// load on EVERY tick -- at 60..1000 Hz, leaking a pipeline per attempt. Remember the exact input
+// set that failed and skip until something that actually matters changes.
+bool StreamDiffusion::setupBlocked(const inputs_t& in) const
+{
+  return m_failed_setup.valid && m_failed_setup == setupKey(in);
+}
+
+void StreamDiffusion::noteSetupFailure(const inputs_t& in)
+{
+  m_failed_setup = setupKey(in);
+}
+
 // Validate + clamp the Resolution port before ANY of it reaches a buffer allocation or the
 // library. Returns false when the request cannot be honoured at all (a non-positive or
 // inconsistent dimension), in which case the caller must skip the frame: (-1,-1) used to sail
@@ -1460,6 +1493,7 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
   if (!m_sd.available || !m_sd.flux2_stream_create)
   {
     std::fprintf(stderr, "FLUX.2-klein: library does not export the flux2 streaming API\n");
+    noteSetupFailure(in_config);
     return;
   }
 
@@ -1480,7 +1514,10 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
     // there is no use-after-free even if a keyframe was mid-flight. This is HEAVY (engine (re)load +
     // producer join) and runs on the GUI thread -> a freeze here is expected ONLY on real config change.
     if (!createKleinStream(in_config))
+    {
+      noteSetupFailure(in_config);
       return;
+    }
     w = m_klein_w;
     h = m_klein_h;
   }
@@ -1531,11 +1568,13 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
                < 0)
     {
       std::fprintf(stderr, "FLUX.2-klein: set_prompt failed\n");
+      noteSetupFailure(in_config);
       return;
     }
     m_klein_prompt = in_config.prompt.value;
     m_klein_queue.clear();            // sync path: new prompt -> don't show stale interpolated frames
   }
+  noteSetupSuccess();   // stream + prompt are live for this input set
 
   // Timesteps control -> klein FlowMatch sigma schedule (native scale, high->low in (0,1]). It SUBSUMES
   // steps + strength: list length = steps, first value = start noise level (=img2img strength). Falls
@@ -1738,6 +1777,7 @@ void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
   if (!m_sd.available || !m_sd.img2img_turbo_create || !m_sd.img2img_turbo_frame)
   {
     std::fprintf(stderr, "img2img-turbo: library does not export the img2img-turbo API\n");
+    noteSetupFailure(in_config);
     return;
   }
 
@@ -1755,6 +1795,7 @@ void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
     if (!m_i2it)
     {
       std::fprintf(stderr, "img2img-turbo: create failed for %s\n", in_config.model.value.c_str());
+      noteSetupFailure(in_config);
       return;
     }
     // CLIP encoder so the embedding can be derived from the Prompt (sd-turbo, pad 0, dim 1024).
@@ -1763,6 +1804,8 @@ void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
     m_i2it_embeddings.reset();
     m_i2it_prompt.clear();
   }
+
+  noteSetupSuccess();   // the turbo pipeline is live for this input set
 
   // Recompute the prompt-derived embedding only when the prompt changes.
   if (m_i2it_clip && m_i2it_prompt != in_config.prompt.value)
@@ -2034,6 +2077,11 @@ void StreamDiffusion::operator()()
   if(in_config.model.value.empty())
     return;
 
+  // N-02: an identical input set that already failed to set up is not retried until one of the
+  // inputs that could change the outcome actually changes.
+  if(setupBlocked(in_config))
+    return;
+
   // FLUX.2-klein has its own self-contained streaming pipeline (separate engines,
   // tokenizer, scheduler and noise handled inside the C-API). It does not use the
   // SD pipeline / CLIP / EngineCache machinery, so dispatch it early.
@@ -2132,7 +2180,10 @@ void StreamDiffusion::operator()()
   if (need_rebuild || !m_cached_engine || !m_cached_engine->pipeline)
   {
     if (!createConfiguration(in_config, new_t1))
+    {
+      noteSetupFailure(in_config);
       return;
+    }
   }
 
   if (!m_cached_engine || !m_cached_engine->pipeline)
@@ -2207,7 +2258,10 @@ void StreamDiffusion::operator()()
   if (need_update_scheduler)
   {
     if (!updateScheduler(in_config.t1.value))
+    {
+      noteSetupFailure(in_config);
       return;
+    }
   }
 
   // Update embeddings if prompt changed
@@ -2216,6 +2270,7 @@ void StreamDiffusion::operator()()
     bool ok = updatePromptEmbeddings(in_config.prompt.value, m_embeddings);
     if(!ok) {
       std::fprintf(stderr, "Invalid prompt\n");
+      noteSetupFailure(in_config);
       return;
     }
   }
@@ -2225,11 +2280,16 @@ void StreamDiffusion::operator()()
     bool ok = updatePromptEmbedding(in_config.negative_prompt.value, m_negative_embeddings);
     if(!ok) {
       std::fprintf(stderr, "Invalid negative prompt\n");
+      noteSetupFailure(in_config);
       return;
     }
     m_sd.prepare_negative_embeds(m_cached_engine->pipeline->get(), m_negative_embeddings.embeddings,
                                  m_config_state.text_seq_len, m_config_state.text_hidden_dim);
   }
+
+  // Setup (engine + scheduler + embeddings) is complete for this input set: clear the N-02
+  // back-off so a later, genuinely different failure is diagnosed on its own terms.
+  noteSetupSuccess();
 
   // Handle seed change
   if (need_reseed)

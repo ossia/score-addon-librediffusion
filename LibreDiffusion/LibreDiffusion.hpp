@@ -440,6 +440,36 @@ private:
 
   inputs_t m_prev_inputs{};
 
+  // --- N-02: back off after a failed setup ------------------------------------------------------
+  // The inputs that determine whether the engine / scheduler / embedding setup can succeed at
+  // all. The continuous knobs (guidance, delta, seed, the scales) are deliberately absent: they
+  // cannot cause a setup failure, and an automated knob must not defeat the back-off by
+  // "changing" on every tick.
+  struct SetupKey
+  {
+    std::string model;
+    std::string prompt;
+    std::string negative_prompt;
+    std::string timesteps;
+    int width{0};
+    int height{0};
+    int8_t workflow{-1};
+    int8_t cfg{-1};
+    int8_t klein_quality{-1};
+    bool add_noise{false};
+    bool denoise_batch{false};
+    bool valid{false};   // false = "no failure recorded"
+
+    friend bool operator==(const SetupKey&, const SetupKey&) noexcept = default;
+  };
+  static SetupKey setupKey(const inputs_t& in_config);
+  // true when the identical input set already failed to set up: skip the tick instead of
+  // re-attempting a full engine load at the host's tick rate.
+  bool setupBlocked(const inputs_t& in_config) const;
+  void noteSetupFailure(const inputs_t& in_config);
+  void noteSetupSuccess() noexcept { m_failed_setup.valid = false; }
+  SetupKey m_failed_setup{};
+
   // Validate + clamp the Resolution port (positive, <= k_max_resolution). Returns false when the
   // request cannot be honoured at all, in which case the frame must be skipped.
   bool resolveResolution(const inputs_t& in_config, int& w, int& h);
