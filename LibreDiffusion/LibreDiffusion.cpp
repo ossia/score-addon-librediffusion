@@ -2107,9 +2107,15 @@ void StreamDiffusion::operator()()
     case Workflow::SDXL_IMG2IMG:
     case Workflow::V2V_IMG2IMG:
     {
+      // An unconnected "In" port (or an early / short readback) delivers the render-target's
+      // width and height while `bytes` is still null: score does this routinely. Building an
+      // rgba_image from a null pointer is a segfault, so skip the frame cleanly -- exactly like
+      // the klein / img2img-turbo / ControlNet / IP-Adapter paths already do.
       if(inputs.image.texture.width <= 0)
         return;
       if(inputs.image.texture.height <= 0)
+        return;
+      if(!inputs.image.texture.bytes)
         return;
       const lo::image_size model_sz{model_tex_w, model_tex_h};
 
