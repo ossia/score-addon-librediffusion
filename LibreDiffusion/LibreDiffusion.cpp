@@ -1626,7 +1626,16 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
   }
   else
   {
-    // Legacy path (older .so): encode every frame.
+    // Legacy path (older .so): encode every frame. flux2_stream_frame is an OPTIONAL symbol --
+    // a .so exporting flux2_stream_create but neither the cached-reference API nor
+    // flux2_stream_frame lands here, and calling through the null pointer is an immediate
+    // segfault. Degrade like every other optional call site instead.
+    if (!m_sd.flux2_stream_frame)
+    {
+      std::fprintf(stderr, "FLUX.2-klein: the librediffusion .so exports neither "
+                  "flux2_stream_frame_cached nor flux2_stream_frame\n");
+      return;
+    }
     auto err = m_sd.flux2_stream_frame(
         m_klein_stream.get(), ref_frame.data(), out_frame.data());
     if (err != LIBREDIFFUSION_SUCCESS)
