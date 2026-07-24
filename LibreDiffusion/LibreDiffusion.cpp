@@ -34,6 +34,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <system_error>
 #include <ranges>
 
 namespace
@@ -44,6 +45,17 @@ inline double now_s_steady()
   return std::chrono::duration<double>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+// Non-throwing std::filesystem::exists. The throwing overload only swallows ENOENT/ENOTDIR:
+// a symlink loop (ELOOP), an unreadable parent (EACCES) or a dead mount raises
+// filesystem_error, and score's render path has no try/catch around operator() -- so a stat()
+// failure on the model folder would terminate the whole application. Anything we cannot stat
+// is simply "not there".
+inline bool file_exists(const std::string& p) noexcept
+{
+  std::error_code ec;
+  return std::filesystem::exists(p, ec) && !ec;
 }
 }
 
@@ -1258,7 +1270,7 @@ bool StreamDiffusion::createKleinStream(const inputs_t& in_config)
   // thread runs RIFE next to diffusion; the render thread does no GPU compute).
   {
     std::string rp = in_config.model.value + "/rife_ifnet_fp16.plan";
-    if (!std::filesystem::exists(rp))
+    if (!file_exists(rp))
       rp = "/media/data2/flux-trt/engine-rife/rife_ifnet_fp16.plan";
     m_klein_rife_path = rp;
   }
@@ -1445,7 +1457,7 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
     if (!m_rife)
     {
       std::string rife_engine = in_config.model.value + "/rife_ifnet_fp16.plan";
-      if (!std::filesystem::exists(rife_engine))
+      if (!file_exists(rife_engine))
         rife_engine = "/media/data2/flux-trt/engine-rife/rife_ifnet_fp16.plan";
       m_rife = SDRife{rife_engine.c_str()};
     }
@@ -1899,7 +1911,7 @@ void StreamDiffusion::ensureSDProducer()
   {
     std::string rp = m_klein_model_path.empty()
         ? std::string() : (m_klein_model_path + "/rife_ifnet_fp16.plan");
-    if (rp.empty() || !std::filesystem::exists(rp))
+    if (rp.empty() || !file_exists(rp))
       rp = "/media/data2/flux-trt/engine-rife/rife_ifnet_fp16.plan";
     m_sd_rife_path = rp;
   }
