@@ -1488,6 +1488,54 @@ void StreamDiffusion::stopKleinProducer()
   m_klein_last_tick_t = 0.0;
 }
 
+// The workflow left klein: nothing else in operator() ever stops the producer, so without this
+// the worker thread keeps diffusing flat out (rerun_when_idle=true) on the klein stream, holding
+// the flux2 handle (~10 GB of VRAM) and the GPU, while the node renders plain SD.
+void StreamDiffusion::releaseKleinResources()
+{
+  if (!m_klein_stream && !m_klein_producer && !m_rife && !m_klein_producer_rife)
+    return;   // nothing to release -- the common per-tick path
+
+  stopKleinProducer();          // drain + join before anything it touches is destroyed
+  m_klein_producer.reset();
+  m_klein_producer_rife.reset();
+  m_rife.reset();
+  m_klein_stream.reset();
+
+  m_klein_model_path.clear();
+  m_klein_quality = -1;
+  m_klein_w = 0;
+  m_klein_h = 0;
+  m_klein_prompt.clear();
+  m_klein_sched.clear();
+  m_klein_mask_hash = 0;
+  m_klein_prev_out.clear();
+  m_klein_have_prev = false;
+  m_klein_ref_hash = 0;
+  m_klein_ref_set = false;
+  m_klein_queue.clear();
+  m_klein_last_exp = -1;
+  ++m_klein_gen;                // invalidate anything still in flight from the old configuration
+}
+
+// Same for the img2img-turbo pipeline: its engines + CLIP encoder + device embedding stay
+// resident otherwise, for a workflow the user has left.
+void StreamDiffusion::releaseTurboResources()
+{
+  if (!m_i2it && !m_i2it_clip && !m_i2it_embeddings)
+    return;
+
+  m_i2it.reset();
+  m_i2it_clip = SDClip{};
+  m_i2it_embeddings.reset();
+  m_i2it_model_path.clear();
+  m_i2it_prompt.clear();
+  m_i2it_in.clear();
+  m_i2it_in.shrink_to_fit();
+  m_i2it_out.clear();
+  m_i2it_out.shrink_to_fit();
+}
+
 void StreamDiffusion::runKlein(const inputs_t& in_config)
 {
   if (!m_sd.available || !m_sd.flux2_stream_create)
@@ -2074,6 +2122,19 @@ void StreamDiffusion::operator()()
     return;
 
   const auto& in_config = this->inputs;
+
+  // Release the self-contained pipelines the current workflow does NOT use, before anything can
+  // return early: they own a worker thread and gigabytes of VRAM that would otherwise stay live
+  // for the whole life of the node (N-03).
+  const bool klein_workflow
+      = in_config.workflow == Workflow::FLUX2_KLEIN_TXT2IMG
+        || in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG
+        || in_config.workflow == Workflow::FLUX2_KLEIN_INPAINT;
+  if(!klein_workflow)
+    releaseKleinResources();
+  if(in_config.workflow != Workflow::IMG2IMG_TURBO)
+    releaseTurboResources();
+
   if(in_config.model.value.empty())
     return;
 
@@ -2085,9 +2146,7 @@ void StreamDiffusion::operator()()
   // FLUX.2-klein has its own self-contained streaming pipeline (separate engines,
   // tokenizer, scheduler and noise handled inside the C-API). It does not use the
   // SD pipeline / CLIP / EngineCache machinery, so dispatch it early.
-  if(in_config.workflow == Workflow::FLUX2_KLEIN_TXT2IMG
-     || in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG
-     || in_config.workflow == Workflow::FLUX2_KLEIN_INPAINT)
+  if(klein_workflow)
   {
     runKlein(in_config);
     return;

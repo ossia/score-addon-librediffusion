@@ -484,6 +484,12 @@ private:
   // FLUX.2-klein streaming path (self-contained, bypasses the SD pipeline machinery)
   void runKlein(const inputs_t& in_config);
   bool createKleinStream(const inputs_t& in_config);
+  // Drop the whole klein side (producer thread, RIFE handles, stream handle, cached state) when
+  // the workflow moves away from klein: nothing else ever stops that thread, and it holds ~10 GB
+  // of VRAM and keeps diffusing flat out for as long as the node lives.
+  void releaseKleinResources();
+  // Same for the img2img-turbo handle (engines + CLIP + its device embedding).
+  void releaseTurboResources();
 
   // img2img-turbo path (self-contained skip-VAE C-API; static 512x512, one-step, host RGBA bytes)
   void runImg2ImgTurbo(const inputs_t& in_config);
