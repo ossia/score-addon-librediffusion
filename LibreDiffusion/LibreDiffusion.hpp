@@ -276,11 +276,16 @@ public:
 
   struct inputs_t
   {
-    halp::texture_input<"In"> image;
+    // NOTE the `{}`: halp::texture_input is an aggregate whose rgba_texture has no default
+    // member initialisers, and avendish default-initialises the effect (`T effect;`). Without
+    // this, texture.{bytes,width,height,changed} are INDETERMINATE until the host writes them --
+    // i.e. every "is the input connected?" test in operator() would read garbage on the very
+    // first tick. Value-initialise them here so an unwritten port is reliably {nullptr, 0, 0}.
+    halp::texture_input<"In"> image{};
     // ControlNet control map (canny/depth/pose/...) OR IP-Adapter style image.
     // Preprocessing is EXTERNAL: feed an already-preprocessed control map here for
     // ControlNet. Only used by the *_CONTROLNET / *_IPADAPTER workflows.
-    halp::texture_input<"Control / Style"> control;
+    halp::texture_input<"Control / Style"> control{};
     // img2img-turbo (IMG2IMG_TURBO) only: the CLIP text embedding [1,77,1024] = 78848 floats, fed from
     // upstream (a prompt-encoder object, or a baked constant for the CycleGAN day2night/etc. models).
     // Keeps CLIP-text out of this node. Unused by every other workflow. (A plain float list, not a
