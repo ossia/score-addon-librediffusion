@@ -142,7 +142,14 @@ public:
   void submit(Job job)
   {
     m_job_tb.produce(std::move(job));
-    m_job_ready.store(true, std::memory_order_release);
+    // The predicate MUST be published under m_wake_mtx (as stop() already does): the worker
+    // evaluates it inside m_job_cv.wait() while holding that mutex, and a store+notify landing
+    // between that evaluation and the worker actually blocking is a lost wakeup -- the job then
+    // sits in the triple buffer, unnoticed, until the next submit.
+    {
+      std::lock_guard<std::mutex> lk(m_wake_mtx);
+      m_job_ready.store(true, std::memory_order_release);
+    }
     m_job_cv.notify_one();
   }
 
