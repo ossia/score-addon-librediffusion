@@ -34,10 +34,14 @@
 // header included by this object pulls the ossia copy, so there is no clash.
 #include "compat/triple_buffer.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <exception>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -179,7 +183,26 @@ private:
 
       m_busy.store(true, std::memory_order_release);
       Frame out;
-      const bool ok = m_produce(job, out);
+      // The produce body allocates w*h*4 (and up to 2^exp times that for a RIFE sweep) and calls
+      // into TensorRT, so bad_alloc / length_error / a library exception are all reachable. An
+      // exception escaping a thread function is std::terminate -- i.e. the whole host process --
+      // with no way for the node to intervene. Treat a throw as a failed frame: publish nothing
+      // and keep the worker alive (the node degrades, the render thread holds its last frame).
+      bool ok = false;
+      try
+      {
+        ok = m_produce(job, out);
+      }
+      catch(const std::exception& e)
+      {
+        std::fprintf(stderr, "AsyncFrameProducer: produce threw (%s); frame dropped\n", e.what());
+        ok = false;
+      }
+      catch(...)
+      {
+        std::fprintf(stderr, "AsyncFrameProducer: produce threw; frame dropped\n");
+        ok = false;
+      }
       if(ok)
         m_frame_tb.produce(std::move(out));
       m_busy.store(false, std::memory_order_release);
