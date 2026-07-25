@@ -50,23 +50,18 @@ inline double now_s_steady()
       .count();
 }
 
-// Non-throwing std::filesystem::exists. The throwing overload only swallows ENOENT/ENOTDIR:
-// a symlink loop (ELOOP), an unreadable parent (EACCES) or a dead mount raises
-// filesystem_error, and score's render path has no try/catch around operator() -- so a stat()
-// failure on the model folder would terminate the whole application. Anything we cannot stat
-// is simply "not there".
+// Non-throwing std::filesystem::exists. The throwing overload only swallows ENOENT/ENOTDIR; a
+// symlink loop, an unreadable parent or a dead mount raises filesystem_error, and score's render
+// path has no try/catch around operator(). Anything we cannot stat is simply "not there".
 inline bool file_exists(const std::string& p) noexcept
 {
   std::error_code ec;
   return std::filesystem::exists(p, ec) && !ec;
 }
 
-// Upper bound for the Resolution port. The spinbox range is 64..2048, but a preset, an
-// automation curve or a remote parameter can deliver anything, and nothing downstream is
-// bounded: halp's texture create() computes `width * height * bytes_per_pixel` with the
-// width*height product in `int` (50000^2 overflows to a negative -> a huge size_t ->
-// length_error out of operator()), while 40000^2 does NOT overflow and simply commits 6.4 GB.
-// 8192 is far above any diffusion model and still only 268 MB per host frame buffer.
+// Upper bound for the Resolution port. The spinbox range is 64..2048, but a preset, an automation
+// curve or a remote parameter can deliver anything, and halp's texture create() computes
+// `width * height * bytes_per_pixel` with the width*height product in `int`.
 constexpr int k_max_resolution = 8192;
 }
 
@@ -138,16 +133,12 @@ parse_input_string(std::string_view str)
   for (auto& e : result_data)
   {
     // x3::double_ parses "nan" and "inf" happily, and a merely huge weight becomes +/-inf when
-    // narrowed to the float blend_embeds takes. Either poisons the WHOLE conditioning tensor
-    // with NaN for the rest of the session, silently. Reject the weighting instead -- the same
-    // outcome the grammar already produces for "(a:1e999)".
+    // narrowed to the float blend_embeds takes; either poisons the whole conditioning tensor.
     if (!std::isfinite(e.value) || std::abs(e.value) > k_max_prompt_weight)
       return std::nullopt;
 
-    // `*(char_ - ':')` accepts '\0' as an ordinary character, so a sub-prompt could hold bytes
-    // past a NUL that every consumer -- all of which go through c_str() into a C API -- would
-    // never see: text.size()==8 while strlen(c_str())==3. Drop the NULs so what we keep is
-    // exactly what CLIP is given.
+    // `*(char_ - ':')` accepts '\0' as an ordinary character, so text.size() can exceed
+    // strlen(c_str()) -- and every consumer reaches CLIP through c_str().
     std::erase(e.text, '\0');
   }
 
@@ -160,26 +151,13 @@ namespace lo
 {
 // Parse the "Timesteps" control into scheduler indices (slots in a 50-entry table).
 //
-// Returns:
-//   * a (possibly empty) list  -- the string was understood; empty means "nothing typed yet";
-//   * std::nullopt             -- the string contains something that is NOT a usable index.
+// Returns a (possibly empty) list when the string was understood -- empty means "nothing typed
+// yet" -- and std::nullopt when it holds something that is not a usable index.
 //
-// The old signature could not express that difference: "", "   ", "abc", ",,," and an emoji all
-// produced the same empty vector, so a typo was indistinguishable from an empty field and the
-// node just went silently dead (and, because the step COUNT drives need_rebuild, re-entered the
-// rebuild path every tick). Three behaviour changes, all deliberate:
-//
-//   * separators are commas AND whitespace, so "1 2 3" -- the most natural way to write three
-//     steps -- yields three steps instead of silently parsing as {1} (strtod stopped at the
-//     first space and the rest of the string was dropped);
-//   * a token must parse COMPLETELY ("12abc", "[" or an emoji is an error, not a silent 12 /
-//     nothing) -- otherwise a half-typed value renders as if it were meant;
-//   * a non-finite value ("1e999", "nan", "inf") is rejected instead of reaching
-//     static_cast<int>, which is undefined behaviour for anything outside int's range (it
-//     happened to land on INT_MIN on x86-64 and get rescued by the clamp).
-//
-// Out-of-range but finite values are still clamped into [0, 49] as before, and "[15, 25]" is
-// still tolerated.
+// Separators are commas AND whitespace, so "1 2 3" is three steps. A token must parse COMPLETELY
+// ("12abc" is an error, not a silent 12), and a non-finite value is rejected rather than reaching
+// static_cast<int>, which is UB outside int's range. Finite out-of-range values are clamped into
+// [0, 49], and "[15, 25]" is tolerated.
 static std::optional<std::vector<int>> get_steps(std::string_view in)
 {
   auto ws = [](unsigned char c){ return c==' '||c=='\t'||c=='\n'||c=='\r'; };
@@ -589,7 +567,7 @@ StreamDiffusion::StreamDiffusion() noexcept
     : m_sd{sd::liblibrediffusion::instance()}
 {
   // halp::texture_output's constructor sets changed = true with bytes == nullptr, so a node that
-  // has never rendered advertises a changed texture pointing at nothing. Start unpublished.
+  // has never rendered would advertise a changed texture pointing at nothing.
   outputs.image.texture.changed = false;
 
   m_prev_inputs.workflow.value = {};
@@ -628,7 +606,7 @@ bool StreamDiffusion::is_available() noexcept
   return sd::liblibrediffusion::instance().available;
 }
 
-// N-02: the input set that decides whether the setup can succeed at all.
+// The input set that decides whether the setup can succeed at all.
 StreamDiffusion::SetupKey StreamDiffusion::setupKey(const inputs_t& in)
 {
   SetupKey k;
@@ -647,10 +625,9 @@ StreamDiffusion::SetupKey StreamDiffusion::setupKey(const inputs_t& in)
   return k;
 }
 
-// `m_prev_inputs = inputs` is only reached on SUCCESS, so before this guard a failing
-// configuration (bad folder, wrong bundle, unparseable timesteps) re-attempted a full engine
-// load on EVERY tick -- at 60..1000 Hz, leaking a pipeline per attempt. Remember the exact input
-// set that failed and skip until something that actually matters changes.
+// `m_prev_inputs = inputs` is only reached on success, so without this a failing configuration
+// re-attempts a full engine load on every tick, at 60..1000 Hz. Remember the exact input set that
+// failed and skip until something that actually matters changes.
 bool StreamDiffusion::setupBlocked(const inputs_t& in) const
 {
   return m_failed_setup.valid && m_failed_setup == setupKey(in);
@@ -661,11 +638,9 @@ void StreamDiffusion::noteSetupFailure(const inputs_t& in)
   m_failed_setup = setupKey(in);
 }
 
-// Validate + clamp the Resolution port before ANY of it reaches a buffer allocation or the
-// library. Returns false when the request cannot be honoured at all (a non-positive or
-// inconsistent dimension), in which case the caller must skip the frame: (-1,-1) used to sail
-// through because create() computes (-1)*(-1)*4 == 4, allocating a four-byte texture and then
-// calling txt2img(..., -1, -1). Diagnoses once per distinct bad value, not once per tick.
+// Validate + clamp the Resolution port before any of it reaches a buffer allocation or the
+// library. Returns false when the request cannot be honoured at all, in which case the caller must
+// skip the frame. Diagnoses once per distinct bad value, not once per tick.
 bool StreamDiffusion::resolveResolution(const inputs_t& in, int& w, int& h)
 {
   const int rw = in.size.value.x;
@@ -698,8 +673,6 @@ void StreamDiffusion::blendTextures()
     const uint8_t* prev_input = (const uint8_t*)m_prev_input.constBits();
     const uint8_t* prev_output = (const uint8_t*)m_prev_output.constBits();
     uint8_t* cur_input = m_cur_input.bits();
-    // (The float alpha/beta normalisation that used to sit here was dead: a/b/c below are
-    // recomputed from the raw knobs, and `b` is already clamped against `a`.)
     const int a = std::clamp(int(inputs.feed_prev_in * 256.f), 0, 256);
     const int b = std::clamp(int(inputs.feed_prev_out * 256.f), 0, 256 - a);
     const int c = 256 - a - b;
@@ -857,13 +830,9 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
     std::fprintf(stderr, "StreamDiffusion: keeping existing engine, will reinit buffers\n");
   }
 
-  // The second CLIP encoder used to be built ONLY in the branch above, i.e. only when this node
-  // was the one that created the cache entry. The EngineCache key is (model path, pipeline mode)
-  // and SD / SDXL / ControlNet / IP-Adapter all share MODE_SINGLE_FRAME, so an entry created by
-  // an SD workflow could never grow the clip2 an SDXL workflow needs: it stayed null forever,
-  // updatePromptEmbedding returned false, and the node rendered NOTHING for as long as the
-  // folder was selected (recoverable only by switching back to SD). Build it on demand instead,
-  // which also keeps the switch cheap -- the expensive UNet/VAE engines are still reused.
+  // The EngineCache key is (model path, pipeline mode) and SD / SDXL / ControlNet / IP-Adapter all
+  // share MODE_SINGLE_FRAME, so an entry created by an SD workflow reaches here without the clip2
+  // an SDXL workflow needs. Build it on demand; the expensive UNet/VAE engines are still reused.
   if (model_type == MODEL_SDXL_TURBO && m_cached_engine && !m_cached_engine->clip2)
   {
     std::string clip2_path = in_config.model.value + "/clip2.engine";
@@ -1129,12 +1098,9 @@ bool StreamDiffusion::updatePromptEmbedding(const std::string& prompt, SDXLEmbed
   if (!m_sd.available || !m_cached_engine || !m_cached_engine->pipeline || !m_cached_engine->clip1)
     return false;
 
-  // The CLIP calls below OVERWRITE the device pointers with a fresh allocation, so anything
-  // already held here has to be released first or it is leaked. The positive path was saved by
-  // updatePromptEmbeddings' `embeddings.clear()`; the negative one (a single long-lived member)
-  // leaked one embedding buffer per prompt edit -- +1000 live device allocations over 1000
-  // changes, with 0 frees. The previous embedding has already been copied into the pipeline by
-  // prepare_(negative_)embeds, so nothing downstream still reads it.
+  // The CLIP calls below OVERWRITE the device pointers with a fresh allocation, so anything already
+  // held here has to be released first or it leaks. The previous embedding has already been copied
+  // into the pipeline by prepare_(negative_)embeds, so nothing downstream still reads it.
   embeddings.reset();
 
   if(m_config_state.model_type == MODEL_SDXL_TURBO)
@@ -1188,9 +1154,8 @@ bool StreamDiffusion::updatePromptEmbeddings(const std::string& prompt, std::vec
     for (const auto& [k, v] : *weights)
     {
       SDXLEmbeddings e;
-      // A failed sub-prompt encode used to be IGNORED: its null device pointer went straight
-      // into the array handed to blend_embeds, which does not null-check its elements -> an
-      // illegal device access that kills the CUDA context for the whole process. Propagate it.
+      // blend_embeds does not null-check its elements, and a null device pointer there is an
+      // illegal access that kills the CUDA context for the whole process.
       if (!updatePromptEmbedding(k, e) || !e.embeddings)
       {
         embeddings.clear();
@@ -1592,9 +1557,8 @@ void StreamDiffusion::stopKleinProducer()
   m_klein_last_tick_t = 0.0;
 }
 
-// The workflow left klein: nothing else in operator() ever stops the producer, so without this
-// the worker thread keeps diffusing flat out (rerun_when_idle=true) on the klein stream, holding
-// the flux2 handle (~10 GB of VRAM) and the GPU, while the node renders plain SD.
+// The workflow left klein: nothing else in operator() ever stops the producer, which would keep
+// diffusing flat out (rerun_when_idle=true) and holding ~10 GB of VRAM while the node renders SD.
 void StreamDiffusion::releaseKleinResources()
 {
   if (!m_klein_stream && !m_klein_producer && !m_rife && !m_klein_producer_rife)
@@ -1623,8 +1587,7 @@ void StreamDiffusion::releaseKleinResources()
   ++m_klein_gen;                // invalidate anything still in flight from the old configuration
 }
 
-// Same for the img2img-turbo pipeline: its engines + CLIP encoder + device embedding stay
-// resident otherwise, for a workflow the user has left.
+// Same for the img2img-turbo pipeline: engines + CLIP encoder + device embedding.
 void StreamDiffusion::releaseTurboResources()
 {
   if (!m_i2it && !m_i2it_clip && !m_i2it_embeddings)
@@ -1657,12 +1620,9 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
   h = std::max(16, (h / 16) * 16);
   const int quality = static_cast<int>(in_config.klein_quality.value);
 
-  // (Re)create the stream pipeline when the model / resolution / quality / SEED changes. The
-  // seed is baked into the stream at creation and there is no reseed entry point in the flux2
-  // API, so leaving it out of this condition (as it was) made the Seed knob a no-op on klein
-  // until something else forced a rebuild. Re-creating is not free -- it reloads the engines --
-  // but a knob that silently does nothing is worse, and the engines come back from the
-  // library's own engine cache.
+  // (Re)create the stream pipeline when the model / resolution / quality / seed changes. The seed
+  // is baked in at creation and the flux2 API has no reseed entry point, so a seed change means a
+  // full re-create; the engines come back from the library's own cache.
   const bool need_new
       = !m_klein_stream || m_klein_model_path != in_config.model.value
         || m_klein_quality != quality || m_klein_w != w || m_klein_h != h
@@ -1865,10 +1825,8 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
   }
   else
   {
-    // Legacy path (older .so): encode every frame. flux2_stream_frame is an OPTIONAL symbol --
-    // a .so exporting flux2_stream_create but neither the cached-reference API nor
-    // flux2_stream_frame lands here, and calling through the null pointer is an immediate
-    // segfault. Degrade like every other optional call site instead.
+    // Legacy path (older .so): encode every frame. flux2_stream_frame is an OPTIONAL symbol, and a
+    // .so exporting neither it nor the cached-reference API lands here.
     if (!m_sd.flux2_stream_frame)
     {
       std::fprintf(stderr, "FLUX.2-klein: the librediffusion .so exports neither "
@@ -2226,11 +2184,9 @@ void StreamDiffusion::runSDAsync(
       m_sd_async_ref_hash, m_sd_async_ref_set, m_sd_async_exp, m_sd_last_tick_t);
 }
 
-// A NaN never equals itself, so `m_prev_inputs.guidance.value != in_config.guidance.value` was
-// TRUE on every tick: a NaN on the Guidance port (from a preset, a division in an automation
-// curve, or a remote parameter) became an unconditional per-tick live update that pushed NaN
-// into the pipeline unvalidated, while std::signbit(NaN - 1.0) made need_rebuild flap as well.
-// The same class of value reaches int(feed_prev * 256.f), where inf/NaN is undefined behaviour.
+// A NaN never equals itself, so every `m_prev_inputs.x != in_config.x` change gate below fires on
+// every tick for a NaN knob, pushing it into the pipeline unvalidated. inf/NaN also reaches
+// int(feed_prev * 256.f), where the cast is UB.
 void StreamDiffusion::sanitizeControls()
 {
   const auto fix = [](float& v, float fallback) {
@@ -2245,9 +2201,9 @@ void StreamDiffusion::sanitizeControls()
   fix(inputs.ipadapter_scale.value, 0.7f);
   fix(inputs.lora_scale.value, 1.0f);
 
-  // These two index fixed-point blend arithmetic (int(v * 256.f)); out of [0,1] the weights stop
-  // meaning anything. The others are passed to the library as-is, deliberately: clamping them to
-  // the widget range would silently change a user's automation.
+  // These two feed fixed-point blend arithmetic (int(v * 256.f)); out of [0,1] the weights stop
+  // meaning anything. The others reach the library as-is: clamping them to the widget range would
+  // silently change a user's automation.
   inputs.feed_prev_in.value = std::clamp(inputs.feed_prev_in.value, 0.0f, 1.0f);
   inputs.feed_prev_out.value = std::clamp(inputs.feed_prev_out.value, 0.0f, 1.0f);
 }
@@ -2263,8 +2219,7 @@ void StreamDiffusion::operator()()
   const auto& in_config = this->inputs;
 
   // Release the self-contained pipelines the current workflow does NOT use, before anything can
-  // return early: they own a worker thread and gigabytes of VRAM that would otherwise stay live
-  // for the whole life of the node (N-03).
+  // return early: they own a worker thread and gigabytes of VRAM.
   const bool klein_workflow
       = in_config.workflow == Workflow::FLUX2_KLEIN_TXT2IMG
         || in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG
@@ -2277,8 +2232,8 @@ void StreamDiffusion::operator()()
   if(in_config.model.value.empty())
     return;
 
-  // N-02: an identical input set that already failed to set up is not retried until one of the
-  // inputs that could change the outcome actually changes.
+  // An input set that already failed to set up is not retried until one of the inputs that could
+  // change the outcome actually changes.
   if(setupBlocked(in_config))
     return;
 
@@ -2303,8 +2258,6 @@ void StreamDiffusion::operator()()
   const auto new_t1 = get_steps(in_config.t1.value);
   if (!new_t1 || new_t1->empty())
   {
-    // A typo is now distinguishable from an empty field, and both are REPORTED rather than
-    // leaving a silently dead node that re-enters the rebuild path on every tick.
     std::fprintf(
         stderr, "StreamDiffusion: Timesteps \"%s\" %s\n", in_config.t1.value.c_str(),
         new_t1 ? "contains no step" : "could not be parsed");
@@ -2403,8 +2356,7 @@ void StreamDiffusion::operator()()
   if (!m_cached_engine || !m_cached_engine->pipeline)
     return;
 
-  // Already validated at the top of operator(); recomputed here so every downstream buffer
-  // allocation and library call uses the CLAMPED value, never the raw port.
+  // Recomputed here so every downstream buffer allocation and library call uses the CLAMPED value.
   int model_tex_w = 0, model_tex_h = 0;
   if (!resolveResolution(in_config, model_tex_w, model_tex_h))
     return;
@@ -2437,10 +2389,8 @@ void StreamDiffusion::operator()()
     case Workflow::SDXL_IMG2IMG:
     case Workflow::V2V_IMG2IMG:
     {
-      // An unconnected "In" port (or an early / short readback) delivers the render-target's
-      // width and height while `bytes` is still null: score does this routinely. Building an
-      // rgba_image from a null pointer is a segfault, so skip the frame cleanly -- exactly like
-      // the klein / img2img-turbo / ControlNet / IP-Adapter paths already do.
+      // An unconnected "In" port (or an early / short readback) delivers the render-target's width
+      // and height while `bytes` is still null: score does this routinely.
       if(inputs.image.texture.width <= 0)
         return;
       if(inputs.image.texture.height <= 0)
@@ -2461,12 +2411,8 @@ void StreamDiffusion::operator()()
 
       blendTextures();
 
-      // Feed the BLENDED buffer to the library. blendTextures() writes into m_cur_input, but
-      // input_tex_bytes used to be re-pointed at it only inside the rescale branch above -- so
-      // whenever the input already matched the model resolution the blend was computed and then
-      // thrown away, and "Feed prev. input/output" silently did nothing. m_cur_input is also
-      // guaranteed to be exactly model_tex_w * model_tex_h * 4 bytes, which the raw input port
-      // is not.
+      // Feed the BLENDED buffer to the library: blendTextures() writes into m_cur_input, which is
+      // also guaranteed to be exactly model_tex_w * model_tex_h * 4 bytes (the raw port is not).
       input_tex_bytes = m_cur_input.bits();
 
       this->outputs.image.create(model_tex_w, model_tex_h);
@@ -2514,8 +2460,8 @@ void StreamDiffusion::operator()()
     }
   }
 
-  // Setup (engine + scheduler + embeddings) is complete for this input set: clear the N-02
-  // back-off so a later, genuinely different failure is diagnosed on its own terms.
+  // Setup (engine + scheduler + embeddings) is complete for this input set: clear the back-off so
+  // a later, genuinely different failure is diagnosed on its own terms.
   noteSetupSuccess();
 
   // Handle seed change
@@ -2644,10 +2590,8 @@ void StreamDiffusion::operator()()
     ++m_sd_gen;
   }
 
-  // Run inference. The return code decides whether a frame is published at all: a failed
-  // txt2img/img2img leaves outputs.image holding whatever the previous frame (or the fresh,
-  // uninitialised allocation) contained, and marking it `changed` would publish that as a real
-  // frame -- silently, since the host has no other error channel here.
+  // The return code decides whether a frame is published at all: a failed txt2img/img2img leaves
+  // outputs.image holding the previous frame (or a fresh, uninitialised allocation).
   bool frame_ok = false;
   switch (this->inputs.workflow)
   {
@@ -2710,8 +2654,6 @@ void StreamDiffusion::operator()()
 
   if (!frame_ok)
   {
-    // Nothing was produced: leave the output marked unchanged so the host does not upload and
-    // display a frame that does not exist.
     this->outputs.image.texture.changed = false;
     return;
   }

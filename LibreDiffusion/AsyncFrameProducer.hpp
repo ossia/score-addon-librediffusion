@@ -143,9 +143,8 @@ public:
   {
     m_job_tb.produce(std::move(job));
     // The predicate MUST be published under m_wake_mtx (as stop() already does): the worker
-    // evaluates it inside m_job_cv.wait() while holding that mutex, and a store+notify landing
-    // between that evaluation and the worker actually blocking is a lost wakeup -- the job then
-    // sits in the triple buffer, unnoticed, until the next submit.
+    // evaluates it inside m_job_cv.wait() while holding that mutex, so a store+notify landing
+    // between that evaluation and the worker blocking is a lost wakeup.
     {
       std::lock_guard<std::mutex> lk(m_wake_mtx);
       m_job_ready.store(true, std::memory_order_release);
@@ -190,11 +189,8 @@ private:
 
       m_busy.store(true, std::memory_order_release);
       Frame out;
-      // The produce body allocates w*h*4 (and up to 2^exp times that for a RIFE sweep) and calls
-      // into TensorRT, so bad_alloc / length_error / a library exception are all reachable. An
-      // exception escaping a thread function is std::terminate -- i.e. the whole host process --
-      // with no way for the node to intervene. Treat a throw as a failed frame: publish nothing
-      // and keep the worker alive (the node degrades, the render thread holds its last frame).
+      // An exception escaping a thread function is std::terminate, i.e. the whole host process.
+      // Treat a throw as a failed frame: publish nothing, keep the worker alive.
       bool ok = false;
       try
       {
@@ -294,10 +290,8 @@ public:
   bool present(double dt, const unsigned char*& out_ptr, size_t& out_bytes)
   {
     // Validate dt exactly like on_keyframe validates its gap: wall-clock deltas can be nonsense
-    // (a rewound or non-monotonic clock, a paused transport, a debugger stop). A negative dt used
-    // to push the accumulator negative, so nothing was emitted until seconds of positive dt had
-    // paid the debt back; a NaN dt wedged the pacer PERMANENTLY (NaN + anything is NaN) and
-    // (int)NaN is undefined behaviour on top.
+    // (a rewound or non-monotonic clock, a paused transport, a debugger stop). A negative dt
+    // stalls the drain; a NaN one wedges it permanently, and (int)NaN is UB.
     if(!(dt > 0.0) || !std::isfinite(dt))
       dt = 0.0;
     else if(dt > 5.0)
@@ -308,8 +302,7 @@ public:
     else
       m_drain_credit += 1.0;  // before the rate is known, fall back to 1-per-tick
 
-    // Bound the accumulator before the cast: it is a product of two measured quantities, and
-    // (int) of an out-of-range double is undefined behaviour.
+    // (int) of an out-of-range double is UB, and this is a product of two measured quantities.
     m_drain_credit = std::clamp(m_drain_credit, 0.0, 1e6);
 
     int to_pop = (int)m_drain_credit;

@@ -276,11 +276,9 @@ public:
 
   struct inputs_t
   {
-    // NOTE the `{}`: halp::texture_input is an aggregate whose rgba_texture has no default
-    // member initialisers, and avendish default-initialises the effect (`T effect;`). Without
-    // this, texture.{bytes,width,height,changed} are INDETERMINATE until the host writes them --
-    // i.e. every "is the input connected?" test in operator() would read garbage on the very
-    // first tick. Value-initialise them here so an unwritten port is reliably {nullptr, 0, 0}.
+    // NOTE the `{}`: halp::texture_input is an aggregate whose rgba_texture has no default member
+    // initialisers and avendish default-initialises the effect, so without it
+    // texture.{bytes,width,height,changed} are indeterminate until the host writes them.
     halp::texture_input<"In"> image{};
     // ControlNet control map (canny/depth/pose/...) OR IP-Adapter style image.
     // Preprocessing is EXTERNAL: feed an already-preprocessed control map here for
@@ -442,14 +440,13 @@ private:
 
   // Replace non-finite knob values with their port defaults and clamp the ones whose arithmetic
   // is not defined out of range. Runs once at the top of every tick, on `inputs` itself, so every
-  // reader downstream (the change gates, the live updates, the blend) sees the same sane value.
+  // reader downstream sees the same sane value.
   void sanitizeControls();
 
-  // --- N-02: back off after a failed setup ------------------------------------------------------
-  // The inputs that determine whether the engine / scheduler / embedding setup can succeed at
-  // all. The continuous knobs (guidance, delta, seed, the scales) are deliberately absent: they
-  // cannot cause a setup failure, and an automated knob must not defeat the back-off by
-  // "changing" on every tick.
+  // The inputs that determine whether the engine / scheduler / embedding setup can succeed at all.
+  // The continuous knobs (guidance, delta, seed, the scales) are deliberately absent: they cannot
+  // cause a setup failure, and an automated knob must not defeat the back-off by changing every
+  // tick.
   struct SetupKey
   {
     std::string model;
@@ -490,8 +487,8 @@ private:
   void runKlein(const inputs_t& in_config);
   bool createKleinStream(const inputs_t& in_config);
   // Drop the whole klein side (producer thread, RIFE handles, stream handle, cached state) when
-  // the workflow moves away from klein: nothing else ever stops that thread, and it holds ~10 GB
-  // of VRAM and keeps diffusing flat out for as long as the node lives.
+  // the workflow moves away from klein: nothing else ever stops that thread, which holds ~10 GB of
+  // VRAM and keeps diffusing flat out for as long as the node lives.
   void releaseKleinResources();
   // The effective klein seed for an input set (FluxRT's fixed-seed convention: 0 -> 52). Shared
   // by createKleinStream and runKlein's recreate condition so they can never disagree.
