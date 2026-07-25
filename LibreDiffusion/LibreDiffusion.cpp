@@ -1306,6 +1306,14 @@ bool load_klein_bn(
 }
 }
 
+unsigned long long StreamDiffusion::kleinSeed(const inputs_t& in_config) noexcept
+{
+  // Fixed seed for temporal coherence (FluxRT convention).
+  const auto seed
+      = static_cast<unsigned long long>(static_cast<uint32_t>(in_config.seed.value));
+  return seed == 0 ? 52ull : seed;
+}
+
 bool StreamDiffusion::createKleinStream(const inputs_t& in_config)
 {
   if (!m_sd.available || !m_sd.flux2_stream_create)
@@ -1334,11 +1342,7 @@ bool StreamDiffusion::createKleinStream(const inputs_t& in_config)
   const std::string vae_enc = model + "/vae_encoder_bf16.plan";
   const std::string tok = model + "/tokenizer.json";
 
-  // Fixed seed for temporal coherence (FluxRT convention).
-  unsigned long long seed
-      = static_cast<unsigned long long>(static_cast<uint32_t>(in_config.seed.value));
-  if (seed == 0)
-    seed = 52ull;
+  const unsigned long long seed = kleinSeed(in_config);
 
   // Phase C: the producer thread holds m_klein_stream's handle. Drain+join it BEFORE destroying the
   // old stream (assigning a new SDFluxStream frees the old handle) -> no use-after-free on reconfig.
@@ -1369,6 +1373,7 @@ bool StreamDiffusion::createKleinStream(const inputs_t& in_config)
 
   m_klein_model_path = model;
   m_klein_quality = quality;
+  m_klein_seed = seed;
   m_klein_w = w;
   m_klein_h = h;
   m_klein_prompt.clear();
@@ -1556,6 +1561,7 @@ void StreamDiffusion::releaseKleinResources()
 
   m_klein_model_path.clear();
   m_klein_quality = -1;
+  m_klein_seed = 0;
   m_klein_w = 0;
   m_klein_h = 0;
   m_klein_prompt.clear();
@@ -1604,10 +1610,16 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
   h = std::max(16, (h / 16) * 16);
   const int quality = static_cast<int>(in_config.klein_quality.value);
 
-  // (Re)create the stream pipeline when the model / resolution / quality changes.
+  // (Re)create the stream pipeline when the model / resolution / quality / SEED changes. The
+  // seed is baked into the stream at creation and there is no reseed entry point in the flux2
+  // API, so leaving it out of this condition (as it was) made the Seed knob a no-op on klein
+  // until something else forced a rebuild. Re-creating is not free -- it reloads the engines --
+  // but a knob that silently does nothing is worse, and the engines come back from the
+  // library's own engine cache.
   const bool need_new
       = !m_klein_stream || m_klein_model_path != in_config.model.value
-        || m_klein_quality != quality || m_klein_w != w || m_klein_h != h;
+        || m_klein_quality != quality || m_klein_w != w || m_klein_h != h
+        || m_klein_seed != kleinSeed(in_config);
   if (need_new)
   {
     // createKleinStream() drains+joins the producer before destroying the old stream handle, so
