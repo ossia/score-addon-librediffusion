@@ -293,10 +293,24 @@ public:
   // `out_bytes` point at the frame to upload (owned by this consumer; valid until the next call).
   bool present(double dt, const unsigned char*& out_ptr, size_t& out_bytes)
   {
+    // Validate dt exactly like on_keyframe validates its gap: wall-clock deltas can be nonsense
+    // (a rewound or non-monotonic clock, a paused transport, a debugger stop). A negative dt used
+    // to push the accumulator negative, so nothing was emitted until seconds of positive dt had
+    // paid the debt back; a NaN dt wedged the pacer PERMANENTLY (NaN + anything is NaN) and
+    // (int)NaN is undefined behaviour on top.
+    if(!(dt > 0.0) || !std::isfinite(dt))
+      dt = 0.0;
+    else if(dt > 5.0)
+      dt = 5.0;   // same plausibility bound as on_keyframe
+
     if(m_prod_rate > 0.0)
       m_drain_credit += m_prod_rate * dt;
     else
       m_drain_credit += 1.0;  // before the rate is known, fall back to 1-per-tick
+
+    // Bound the accumulator before the cast: it is a product of two measured quantities, and
+    // (int) of an out-of-range double is undefined behaviour.
+    m_drain_credit = std::clamp(m_drain_credit, 0.0, 1e6);
 
     int to_pop = (int)m_drain_credit;
     if(to_pop > 0)
