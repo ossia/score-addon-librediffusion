@@ -651,14 +651,8 @@ void StreamDiffusion::blendTextures()
     const uint8_t* prev_input = (const uint8_t*)m_prev_input.constBits();
     const uint8_t* prev_output = (const uint8_t*)m_prev_output.constBits();
     uint8_t* cur_input = m_cur_input.bits();
-    float alpha = inputs.feed_prev_in;
-    float beta = inputs.feed_prev_out;
-    const float sum = alpha + beta;
-    if(sum > 1.f)
-    {
-      alpha /= sum;
-      beta /= sum;
-    }
+    // (The float alpha/beta normalisation that used to sit here was dead: a/b/c below are
+    // recomputed from the raw knobs, and `b` is already clamped against `a`.)
     const int a = std::clamp(int(inputs.feed_prev_in * 256.f), 0, 256);
     const int b = std::clamp(int(inputs.feed_prev_out * 256.f), 0, 256 - a);
     const int c = 256 - a - b;
@@ -2352,11 +2346,17 @@ void StreamDiffusion::operator()()
          || model_tex_h != inputs.image.texture.height)
       {
         m_cur_input = m_cur_input.scaled(model_sz);
-
-        input_tex_bytes = m_cur_input.bits();
       }
 
       blendTextures();
+
+      // Feed the BLENDED buffer to the library. blendTextures() writes into m_cur_input, but
+      // input_tex_bytes used to be re-pointed at it only inside the rescale branch above -- so
+      // whenever the input already matched the model resolution the blend was computed and then
+      // thrown away, and "Feed prev. input/output" silently did nothing. m_cur_input is also
+      // guaranteed to be exactly model_tex_w * model_tex_h * 4 bytes, which the raw input port
+      // is not.
+      input_tex_bytes = m_cur_input.bits();
 
       this->outputs.image.create(model_tex_w, model_tex_h);
       break;
