@@ -2321,6 +2321,7 @@ void StreamDiffusion::operator()()
   bool need_reseed = false;
   bool need_update_guidance = false;
   bool need_update_delta = false;
+  bool need_update_lora = false;
   if (n_prev_t1 != n_new_t1 || n_new_t1 <= 0)
     need_rebuild = true;
   if (m_prev_inputs.add_noise.value != in_config.add_noise.value)
@@ -2352,6 +2353,11 @@ void StreamDiffusion::operator()()
     need_update_guidance = true;
   if (m_prev_inputs.delta.value != in_config.delta.value)
     need_update_delta= true;
+  // Runtime LoRA is gated on m_config_state (the last value actually pushed), not on
+  // m_prev_inputs, because the engine may not expose a lora_scale input at all.
+  if (m_sd.num_runtime_loras && m_sd.set_lora_scale
+      && in_config.lora_scale != m_config_state.lora_scale)
+    need_update_lora = true;
 
   if (need_rebuild)
   {
@@ -2378,7 +2384,7 @@ void StreamDiffusion::operator()()
   if (m_sd_producer && m_sd_producer->running()
       && (need_rebuild || need_update_scheduler || need_update_positive_embeds
           || need_update_negative_embeds || need_reseed || need_update_guidance
-          || need_update_delta))
+          || need_update_delta || need_update_lora))
   {
     stopSDProducer();
     ++m_sd_gen;
@@ -2610,8 +2616,7 @@ void StreamDiffusion::operator()()
   // Runtime LoRA: if the loaded UNet engine declares lora_scale[N] (exported with --lora PATH:runtime),
   // drive its strength live from the "LoRA scale" knob (uniform across all slots). Change-gated; a no-op
   // for engines without the input (num_runtime_loras == 0).
-  if(m_sd.num_runtime_loras && m_sd.set_lora_scale
-     && in_config.lora_scale != m_config_state.lora_scale)
+  if(need_update_lora)
   {
     const int nl = m_sd.num_runtime_loras(m_cached_engine->pipeline->get());
     if(nl > 0)
