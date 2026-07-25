@@ -1105,8 +1105,15 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
   // Create or reinit pipeline
   if (m_cached_engine->pipeline && *m_cached_engine->pipeline)
   {
-    // Rreinit buffers with new config
-    m_sd.pipeline_reinit_buffers(m_cached_engine->pipeline->get(), config.get());
+    // Reinit buffers with the new config. This can be REFUSED -- the engines cannot be reloaded
+    // here, so a geometry outside their optimization profiles installs nothing and returns -7. The
+    // pipeline then keeps its old size while the node would allocate an output texture at the new
+    // one, and the .so's live rgba_resize would quietly hand back a rescaled render of the old
+    // geometry with nothing to show for it.
+    if (!accepted(
+            m_sd.pipeline_reinit_buffers(m_cached_engine->pipeline->get(), config.get()),
+            "pipeline_reinit_buffers"))
+      return false;
   }
   else
   {
