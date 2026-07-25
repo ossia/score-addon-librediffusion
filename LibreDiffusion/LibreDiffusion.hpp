@@ -488,6 +488,9 @@ private:
   // the workflow moves away from klein: nothing else ever stops that thread, and it holds ~10 GB
   // of VRAM and keeps diffusing flat out for as long as the node lives.
   void releaseKleinResources();
+  // The effective klein seed for an input set (FluxRT's fixed-seed convention: 0 -> 52). Shared
+  // by createKleinStream and runKlein's recreate condition so they can never disagree.
+  static unsigned long long kleinSeed(const inputs_t& in_config) noexcept;
   // Same for the img2img-turbo handle (engines + CLIP + its device embedding).
   void releaseTurboResources();
 
@@ -505,6 +508,7 @@ private:
   SDRife m_rife;
   std::string m_klein_model_path;
   int m_klein_quality{-1};
+  unsigned long long m_klein_seed{0};   // seed the live stream was created with (0 = no stream)
   int m_klein_w{0};
   int m_klein_h{0};
   std::string m_klein_prompt;
