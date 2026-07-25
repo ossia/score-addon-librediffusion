@@ -541,6 +541,10 @@ void SDXLEmbeddings::reset()
 StreamDiffusion::StreamDiffusion() noexcept
     : m_sd{sd::liblibrediffusion::instance()}
 {
+  // halp::texture_output's constructor sets changed = true with bytes == nullptr, so a node that
+  // has never rendered advertises a changed texture pointing at nothing. Start unpublished.
+  outputs.image.texture.changed = false;
+
   m_prev_inputs.workflow.value = {};
   m_prev_inputs.add_noise.value = {};
   m_prev_inputs.prompt.value = {};
@@ -1100,8 +1104,10 @@ bool StreamDiffusion::updatePromptEmbedding(const std::string& prompt, SDXLEmbed
       return false;
 
     // Prepare SDXL conditioning
-    m_sd.prepare_sdxl_conditioning(
-        m_cached_engine->pipeline->get(), embeddings.pooled_embeds, embeddings.time_ids);
+    if (m_sd.prepare_sdxl_conditioning(
+            m_cached_engine->pipeline->get(), embeddings.pooled_embeds, embeddings.time_ids)
+        != LIBREDIFFUSION_SUCCESS)
+      return false;
   }
   else
   {
@@ -1149,7 +1155,9 @@ bool StreamDiffusion::updatePromptEmbeddings(const std::string& prompt, std::vec
     if (bembeds.empty())
       return false;
 
-    m_sd.blend_embeds(m_cached_engine->pipeline->get(), bembeds.data(), bweight.data(), bembeds.size(), m_config_state.text_seq_len, m_config_state.text_hidden_dim);
+    if (m_sd.blend_embeds(m_cached_engine->pipeline->get(), bembeds.data(), bweight.data(), bembeds.size(), m_config_state.text_seq_len, m_config_state.text_hidden_dim)
+        != LIBREDIFFUSION_SUCCESS)
+      return false;
   }
   else
   {
@@ -1161,8 +1169,10 @@ bool StreamDiffusion::updatePromptEmbeddings(const std::string& prompt, std::vec
     }
     embeddings.push_back(std::move(e));
 
-    m_sd.prepare_embeds(m_cached_engine->pipeline->get(), embeddings.front().embeddings,
-                        m_config_state.text_seq_len, m_config_state.text_hidden_dim);
+    if (m_sd.prepare_embeds(m_cached_engine->pipeline->get(), embeddings.front().embeddings,
+                            m_config_state.text_seq_len, m_config_state.text_hidden_dim)
+        != LIBREDIFFUSION_SUCCESS)
+      return false;
   }
   return true;
 }
@@ -1244,13 +1254,18 @@ bool StreamDiffusion::updateScheduler(const std::string& timestep_str)
   if (timesteps.empty())
     return false;
 
-  m_sd.prepare_scheduler(m_cached_engine->pipeline->get(),
+  const auto err = m_sd.prepare_scheduler(m_cached_engine->pipeline->get(),
                           timesteps.data(),
                           alpha_list.data(),
                           beta_list.data(),
                           c_skip_list.data(),
                           c_out_list.data(),
                           timesteps.size());
+  if (err != LIBREDIFFUSION_SUCCESS)
+  {
+    std::fprintf(stderr, "StreamDiffusion: prepare_scheduler failed (%d)\n", (int)err);
+    return false;
+  }
 
   return true;
 }
@@ -2377,8 +2392,15 @@ void StreamDiffusion::operator()()
       noteSetupFailure(in_config);
       return;
     }
-    m_sd.prepare_negative_embeds(m_cached_engine->pipeline->get(), m_negative_embeddings.embeddings,
-                                 m_config_state.text_seq_len, m_config_state.text_hidden_dim);
+    if (m_sd.prepare_negative_embeds(
+            m_cached_engine->pipeline->get(), m_negative_embeddings.embeddings,
+            m_config_state.text_seq_len, m_config_state.text_hidden_dim)
+        != LIBREDIFFUSION_SUCCESS)
+    {
+      std::fprintf(stderr, "StreamDiffusion: prepare_negative_embeds failed\n");
+      noteSetupFailure(in_config);
+      return;
+    }
   }
 
   // Setup (engine + scheduler + embeddings) is complete for this input set: clear the N-02
@@ -2512,7 +2534,11 @@ void StreamDiffusion::operator()()
     ++m_sd_gen;
   }
 
-  // Run inference
+  // Run inference. The return code decides whether a frame is published at all: a failed
+  // txt2img/img2img leaves outputs.image holding whatever the previous frame (or the fresh,
+  // uninitialised allocation) contained, and marking it `changed` would publish that as a real
+  // frame -- silently, since the host has no other error channel here.
+  bool frame_ok = false;
   switch (this->inputs.workflow)
   {
     case Workflow::FLUX2_KLEIN_TXT2IMG:
@@ -2527,11 +2553,17 @@ void StreamDiffusion::operator()()
     case Workflow::SDTURBO_TXT2IMG:
     case Workflow::SDXL_TXT2IMG:
     case Workflow::V2V_TXT2IMG:
-      m_sd.txt2img(m_cached_engine->pipeline->get(),
-                   outputs.image.texture.bytes,
-                   model_tex_w,
-                   model_tex_h);
+    {
+      const auto err = m_sd.txt2img(m_cached_engine->pipeline->get(),
+                                    outputs.image.texture.bytes,
+                                    model_tex_w,
+                                    model_tex_h);
+      if (err != LIBREDIFFUSION_SUCCESS)
+        std::fprintf(stderr, "StreamDiffusion: txt2img failed (%d)\n", (int)err);
+      else
+        frame_ok = true;
       break;
+    }
 
     case Workflow::SD_IMG2IMG:
     case Workflow::SD_IMG2IMG_CONTROLNET:
@@ -2542,9 +2574,16 @@ void StreamDiffusion::operator()()
     case Workflow::V2V_IMG2IMG:
       if (input_tex_bytes)
       {
-        m_sd.img2img(
+        const auto err = m_sd.img2img(
             m_cached_engine->pipeline->get(), input_tex_bytes,
             outputs.image.texture.bytes, model_tex_w, model_tex_h);
+        if (err != LIBREDIFFUSION_SUCCESS)
+        {
+          std::fprintf(stderr, "StreamDiffusion: img2img failed (%d)\n", (int)err);
+          break;
+        }
+        frame_ok = true;
+
         if(inputs.feed_prev_in > 0)
         {
           m_prev_input = lo::rgba_image(input_tex_bytes, model_tex_w, model_tex_h);
@@ -2557,6 +2596,14 @@ void StreamDiffusion::operator()()
         }
       }
       break;
+  }
+
+  if (!frame_ok)
+  {
+    // Nothing was produced: leave the output marked unchanged so the host does not upload and
+    // display a frame that does not exist.
+    this->outputs.image.texture.changed = false;
+    return;
   }
 
   this->outputs.image.texture.changed = true;
