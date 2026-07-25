@@ -1082,6 +1082,14 @@ bool StreamDiffusion::updatePromptEmbedding(const std::string& prompt, SDXLEmbed
   if (!m_sd.available || !m_cached_engine || !m_cached_engine->pipeline || !m_cached_engine->clip1)
     return false;
 
+  // The CLIP calls below OVERWRITE the device pointers with a fresh allocation, so anything
+  // already held here has to be released first or it is leaked. The positive path was saved by
+  // updatePromptEmbeddings' `embeddings.clear()`; the negative one (a single long-lived member)
+  // leaked one embedding buffer per prompt edit -- +1000 live device allocations over 1000
+  // changes, with 0 frees. The previous embedding has already been copied into the pipeline by
+  // prepare_(negative_)embeds, so nothing downstream still reads it.
+  embeddings.reset();
+
   if(m_config_state.model_type == MODEL_SDXL_TURBO)
   {
     if (!m_cached_engine->clip2)
