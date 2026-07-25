@@ -647,8 +647,11 @@ bool StreamDiffusion::resolveResolution(const inputs_t& in, int& w, int& h)
   const int rh = in.size.value.y;
   const bool usable = (rw > 0 && rh > 0);
 
-  w = usable ? std::min(rw, k_max_resolution) : rw;
-  h = usable ? std::min(rh, k_max_resolution) : rh;
+  // The latent grid is width/8 by height/8 and the library refuses a size that is not a whole
+  // number of latent cells. The port has step 1, so 100 / 513 / 777 are all one drag away; round
+  // DOWN to the nearest multiple of 8 (never up, so the clamp above stays a clamp), floor 8.
+  w = usable ? std::max(8, std::min(rw, k_max_resolution) & ~7) : rw;
+  h = usable ? std::max(8, std::min(rh, k_max_resolution) & ~7) : rh;
 
   if((!usable || w != rw || h != rh)
      && (rw != m_reported_size_w || rh != m_reported_size_h))
@@ -656,8 +659,8 @@ bool StreamDiffusion::resolveResolution(const inputs_t& in, int& w, int& h)
     m_reported_size_w = rw;
     m_reported_size_h = rh;
     std::fprintf(
-        stderr, "StreamDiffusion: Resolution %dx%d is out of range (1..%d) -- %s\n", rw, rh,
-        k_max_resolution, usable ? "clamped" : "frame skipped");
+        stderr, "StreamDiffusion: Resolution %dx%d -- %s (usable range 8..%d, multiples of 8)\n",
+        rw, rh, usable ? "adjusted" : "frame skipped", k_max_resolution);
   }
   return usable;
 }
@@ -944,14 +947,34 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
   if (!config)
     return false;
 
+  // The setters that VALIDATE reject a request instead of storing it, and the config then keeps its
+  // defaults (512x512 / 64x64 latents) while everything downstream reports success -- so the
+  // pipeline would be built and driven at a geometry nobody asked for. Refuse the configuration.
+  auto accepted = [](librediffusion_error_t err, const char* what) {
+    if (err == LIBREDIFFUSION_SUCCESS)
+      return true;
+    std::fprintf(stderr, "StreamDiffusion: %s rejected the request (%d)\n", what, (int)err);
+    return false;
+  };
+
   // Apply settings via C API
   m_sd.config_set_device(config.get(), 0);
   m_sd.config_set_model_type(config.get(), model_type);
   m_sd.config_set_pipeline_mode(config.get(), pipeline_mode);
-  m_sd.config_set_dimensions(
-      config.get(), width, height, m_config_state.latent_width, m_config_state.latent_height);
-  m_sd.config_set_batch_size(config.get(), m_config_state.batch_size);
-  m_sd.config_set_denoising_steps(config.get(), m_config_state.denoising_steps);
+  if (!accepted(
+          m_sd.config_set_dimensions(
+              config.get(), width, height, m_config_state.latent_width,
+              m_config_state.latent_height),
+          "config_set_dimensions"))
+    return false;
+  if (!accepted(
+          m_sd.config_set_batch_size(config.get(), m_config_state.batch_size),
+          "config_set_batch_size"))
+    return false;
+  if (!accepted(
+          m_sd.config_set_denoising_steps(config.get(), m_config_state.denoising_steps),
+          "config_set_denoising_steps"))
+    return false;
   m_sd.config_set_guidance_scale(config.get(), m_config_state.guidance_scale);
   m_sd.config_set_delta(config.get(), m_config_state.delta);
   m_sd.config_set_add_noise(config.get(), m_config_state.do_add_noise ? 1 : 0);
@@ -971,13 +994,19 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
     m_sd.config_set_cuda_graph(config.get(), one_step_graphable ? 1 : 0);
   }
 
-  m_sd.config_set_text_config(
-      config.get(), m_config_state.text_seq_len, m_config_state.text_hidden_dim,
-      m_config_state.clip_pad_token);
+  if (!accepted(
+          m_sd.config_set_text_config(
+              config.get(), m_config_state.text_seq_len, m_config_state.text_hidden_dim,
+              m_config_state.clip_pad_token),
+          "config_set_text_config"))
+    return false;
 
   if(model_type == MODEL_SDXL_TURBO)
   {
-    m_sd.config_set_sdxl_config(config.get(), m_config_state.pooled_embedding_dim, 6);
+    if (!accepted(
+            m_sd.config_set_sdxl_config(config.get(), m_config_state.pooled_embedding_dim, 6),
+            "config_set_sdxl_config"))
+      return false;
   }
 
   m_sd.config_set_unet_engine(config.get(), m_config_state.unet_engine_path.c_str());
