@@ -1922,20 +1922,18 @@ void StreamDiffusion::runKlein(const inputs_t& in_config)
 }
 
 // github.com/GaParmar/img2img-turbo: one-step image translation through the self-contained skip-VAE
-// C-API. Static 512x512. Host RGBA bytes in/out (the C-API does the device work internally, like
-// klein's flux2_stream_frame). The CLIP text embedding comes from the "Embedding" buffer inlet
-// (upstream prompt-encoder, or a baked CycleGAN constant) — no CLIP in this node. Synchronous.
+// C-API. Host RGBA bytes in/out (the C-API does the device work internally, like klein's
+// flux2_stream_frame). The CLIP text embedding comes from the "Embedding" buffer inlet (upstream
+// prompt-encoder, or a baked CycleGAN constant) — no CLIP in this node. Synchronous.
 void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
 {
-  if (!m_sd.available || !m_sd.img2img_turbo_create || !m_sd.img2img_turbo_frame)
+  if (!m_sd.available || !m_sd.img2img_turbo_create || !m_sd.img2img_turbo_frame_sized
+      || !m_sd.img2img_turbo_frame_bytes || !m_sd.img2img_turbo_ehs_elements)
   {
     std::fprintf(stderr, "img2img-turbo: library does not export the img2img-turbo API\n");
     noteSetupFailure(in_config);
     return;
   }
-
-  // The engines are static 512x512 (see the export). Resolution control is ignored for this workflow.
-  constexpr int w = 512, h = 512;
 
   // (Re)create the pipeline when the model (engine folder) changes.
   if (!m_i2it || m_i2it_model_path != in_config.model.value)
@@ -1960,6 +1958,22 @@ void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
 
   noteSetupSuccess();   // the turbo pipeline is live for this input set
 
+  // The geometry is the ENGINES', not the 512x512 constant this was written against: on any other
+  // export the old code scaled to 512, allocated 512*512*4 and handed those buffers to entry points
+  // that read and write the engine's own size (L-03). Ask the library, and size everything from it.
+  const size_t frame_bytes = (size_t)m_sd.img2img_turbo_frame_bytes(m_i2it.get());
+  const size_t ehs_elems = (size_t)m_sd.img2img_turbo_ehs_elements(m_i2it.get());
+  int w = 0, h = 0;
+  if (frame_bytes == 0 || ehs_elems == 0
+      || m_sd.img2img_turbo_frame_size(m_i2it.get(), &w, &h) != LIBREDIFFUSION_SUCCESS
+      || w <= 0 || h <= 0)
+  {
+    std::fprintf(
+        stderr, "img2img-turbo: engine reports %dx%d, %zu bytes/frame, %zu ehs elements\n", w, h,
+        frame_bytes, ehs_elems);
+    return;
+  }
+
   // Recompute the prompt-derived embedding only when the prompt changes.
   if (m_i2it_clip && m_i2it_prompt != in_config.prompt.value)
   {
@@ -1972,31 +1986,33 @@ void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
     m_i2it_prompt = in_config.prompt.value;
   }
 
-  // Input frame -> RGBA8 512x512 (Canny / any preprocessing is upstream; we feed the In frame as-is).
+  // Input frame -> the engine's RGBA8 (Canny / any preprocessing is upstream; In goes in as-is).
   if (inputs.image.texture.width <= 0 || inputs.image.texture.height <= 0
       || !inputs.image.texture.bytes)
     return;
-  m_i2it_in.assign((size_t)w * h * 4, 0);
+  m_i2it_in.assign(frame_bytes, 0);
   lo::rgba_image in(
       inputs.image.texture.bytes, inputs.image.texture.width, inputs.image.texture.height);
   if (inputs.image.texture.width != w || inputs.image.texture.height != h)
     in = in.scaled({w, h});
   std::memcpy(
-      m_i2it_in.data(), in.constBits(), std::min<size_t>((size_t)w * h * 4, in.sizeInBytes()));
+      m_i2it_in.data(), in.constBits(), std::min<size_t>(frame_bytes, in.sizeInBytes()));
 
-  // Embedding [1,77,1024]: the explicit "Embedding" port overrides; otherwise use the prompt-derived
-  // device fp16 from CLIP. Skip the frame if neither is available.
-  m_i2it_out.assign((size_t)w * h * 4, 0);
+  // Embedding: the explicit "Embedding" port overrides; otherwise use the prompt-derived device
+  // fp16 from CLIP. Skip the frame if neither is available.
+  m_i2it_out.assign(frame_bytes, 0);
   librediffusion_error_t err = LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
-  if (inputs.ehs.value.size() >= (size_t)77 * 1024)
+  if (inputs.ehs.value.size() >= ehs_elems)
   {
-    err = m_sd.img2img_turbo_frame(
-        m_i2it.get(), m_i2it_in.data(), inputs.ehs.value.data(), m_i2it_out.data());
+    err = m_sd.img2img_turbo_frame_sized(
+        m_i2it.get(), m_i2it_in.data(), m_i2it_in.size(), inputs.ehs.value.data(),
+        inputs.ehs.value.size(), m_i2it_out.data(), m_i2it_out.size());
   }
-  else if (m_i2it_embeddings.embeddings && m_sd.img2img_turbo_frame_dev)
+  else if (m_i2it_embeddings.embeddings && m_sd.img2img_turbo_frame_dev_sized)
   {
-    err = m_sd.img2img_turbo_frame_dev(
-        m_i2it.get(), m_i2it_in.data(), m_i2it_embeddings.embeddings, m_i2it_out.data());
+    err = m_sd.img2img_turbo_frame_dev_sized(
+        m_i2it.get(), m_i2it_in.data(), m_i2it_in.size(), m_i2it_embeddings.embeddings,
+        m_i2it_out.data(), m_i2it_out.size());
   }
   else
   {
@@ -2009,7 +2025,7 @@ void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
   }
 
   this->outputs.image.create(w, h);
-  std::memcpy(outputs.image.texture.bytes, m_i2it_out.data(), (size_t)w * h * 4);
+  std::memcpy(outputs.image.texture.bytes, m_i2it_out.data(), frame_bytes);
   outputs.image.texture.changed = true;
 
   m_prev_inputs = inputs;
