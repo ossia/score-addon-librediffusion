@@ -118,6 +118,10 @@ auto const data_list_def = data_item % ',';
 
 BOOST_SPIRIT_DEFINE(text_content, number, data_item, data_list);
 
+// Blend weights are multiplied into every element of the conditioning tensor and are narrowed to
+// float on the way to blend_embeds, so anything beyond this is either a typo or an overflow.
+constexpr double k_max_prompt_weight = 1e6;
+
 std::optional<std::vector<WeightedPromptElement>>
 parse_input_string(std::string_view str)
 {
@@ -128,10 +132,26 @@ parse_input_string(std::string_view str)
   const auto success = x3::phrase_parse(
       iterator, end_iterator, data_list, x3::ascii::space, result_data);
 
-  if (success && iterator == end_iterator)
-    return result_data;
+  if (!(success && iterator == end_iterator))
+    return std::nullopt;
 
-  return std::nullopt;
+  for (auto& e : result_data)
+  {
+    // x3::double_ parses "nan" and "inf" happily, and a merely huge weight becomes +/-inf when
+    // narrowed to the float blend_embeds takes. Either poisons the WHOLE conditioning tensor
+    // with NaN for the rest of the session, silently. Reject the weighting instead -- the same
+    // outcome the grammar already produces for "(a:1e999)".
+    if (!std::isfinite(e.value) || std::abs(e.value) > k_max_prompt_weight)
+      return std::nullopt;
+
+    // `*(char_ - ':')` accepts '\0' as an ordinary character, so a sub-prompt could hold bytes
+    // past a NUL that every consumer -- all of which go through c_str() into a C API -- would
+    // never see: text.size()==8 while strlen(c_str())==3. Drop the NULs so what we keep is
+    // exactly what CLIP is given.
+    std::erase(e.text, '\0');
+  }
+
+  return result_data;
 }
 
 }
