@@ -2226,11 +2226,39 @@ void StreamDiffusion::runSDAsync(
       m_sd_async_ref_hash, m_sd_async_ref_set, m_sd_async_exp, m_sd_last_tick_t);
 }
 
+// A NaN never equals itself, so `m_prev_inputs.guidance.value != in_config.guidance.value` was
+// TRUE on every tick: a NaN on the Guidance port (from a preset, a division in an automation
+// curve, or a remote parameter) became an unconditional per-tick live update that pushed NaN
+// into the pipeline unvalidated, while std::signbit(NaN - 1.0) made need_rebuild flap as well.
+// The same class of value reaches int(feed_prev * 256.f), where inf/NaN is undefined behaviour.
+void StreamDiffusion::sanitizeControls()
+{
+  const auto fix = [](float& v, float fallback) {
+    if(!std::isfinite(v))
+      v = fallback;
+  };
+  fix(inputs.guidance.value, 1.0f);
+  fix(inputs.delta.value, 1.0f);
+  fix(inputs.feed_prev_in.value, 0.0f);
+  fix(inputs.feed_prev_out.value, 0.0f);
+  fix(inputs.controlnet_scale.value, 0.6f);
+  fix(inputs.ipadapter_scale.value, 0.7f);
+  fix(inputs.lora_scale.value, 1.0f);
+
+  // These two index fixed-point blend arithmetic (int(v * 256.f)); out of [0,1] the weights stop
+  // meaning anything. The others are passed to the library as-is, deliberately: clamping them to
+  // the widget range would silently change a user's automation.
+  inputs.feed_prev_in.value = std::clamp(inputs.feed_prev_in.value, 0.0f, 1.0f);
+  inputs.feed_prev_out.value = std::clamp(inputs.feed_prev_out.value, 0.0f, 1.0f);
+}
+
 void StreamDiffusion::operator()()
 {
   // Check library availability
   if (!m_sd.available)
     return;
+
+  sanitizeControls();
 
   const auto& in_config = this->inputs;
 

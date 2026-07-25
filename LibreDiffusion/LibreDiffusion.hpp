@@ -440,6 +440,11 @@ private:
 
   inputs_t m_prev_inputs{};
 
+  // Replace non-finite knob values with their port defaults and clamp the ones whose arithmetic
+  // is not defined out of range. Runs once at the top of every tick, on `inputs` itself, so every
+  // reader downstream (the change gates, the live updates, the blend) sees the same sane value.
+  void sanitizeControls();
+
   // --- N-02: back off after a failed setup ------------------------------------------------------
   // The inputs that determine whether the engine / scheduler / embedding setup can succeed at
   // all. The continuous knobs (guidance, delta, seed, the scales) are deliberately absent: they
