@@ -31,9 +31,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
+#include <string_view>
 #include <system_error>
 #include <ranges>
 
@@ -135,38 +138,62 @@ parse_input_string(std::string_view str)
 
 namespace lo
 {
-static std::vector<int> get_steps(std::string s)
+// Parse the "Timesteps" control into scheduler indices (slots in a 50-entry table).
+//
+// Returns:
+//   * a (possibly empty) list  -- the string was understood; empty means "nothing typed yet";
+//   * std::nullopt             -- the string contains something that is NOT a usable index.
+//
+// The old signature could not express that difference: "", "   ", "abc", ",,," and an emoji all
+// produced the same empty vector, so a typo was indistinguishable from an empty field and the
+// node just went silently dead (and, because the step COUNT drives need_rebuild, re-entered the
+// rebuild path every tick). Three behaviour changes, all deliberate:
+//
+//   * separators are commas AND whitespace, so "1 2 3" -- the most natural way to write three
+//     steps -- yields three steps instead of silently parsing as {1} (strtod stopped at the
+//     first space and the rest of the string was dropped);
+//   * a token must parse COMPLETELY ("12abc", "[" or an emoji is an error, not a silent 12 /
+//     nothing) -- otherwise a half-typed value renders as if it were meant;
+//   * a non-finite value ("1e999", "nan", "inf") is rejected instead of reaching
+//     static_cast<int>, which is undefined behaviour for anything outside int's range (it
+//     happened to land on INT_MIN on x86-64 and get rescued by the clamp).
+//
+// Out-of-range but finite values are still clamped into [0, 49] as before, and "[15, 25]" is
+// still tolerated.
+static std::optional<std::vector<int>> get_steps(std::string_view in)
 {
   auto ws = [](unsigned char c){ return c==' '||c=='\t'||c=='\n'||c=='\r'; };
-  std::size_t b = 0, e = s.size();
-  while(b < e && ws(s[b])) ++b;
-  while(e > b && ws(s[e-1])) --e;
-  s = s.substr(b, e - b);
-  if(s.empty())
-    return {};
-  if(s.front() == '[' && s.back() == ']')   // tolerate "[a, b]"
+  auto sep = [&](unsigned char c){ return ws(c) || c == ','; };
+
+  std::size_t b = 0, e = in.size();
+  while(b < e && ws(in[b])) ++b;
+  while(e > b && ws(in[e-1])) --e;
+  std::string_view s = in.substr(b, e - b);
+  if(s.size() >= 2 && s.front() == '[' && s.back() == ']')   // tolerate "[a, b]"
     s = s.substr(1, s.size() - 2);
 
   std::vector<int> result;
   std::size_t pos = 0;
-  while(true)
+  while(pos < s.size())
   {
-    std::size_t comma = s.find(',', pos);
-    std::size_t tend = (comma == std::string::npos) ? s.size() : comma;
-    std::size_t tb = pos, te = tend;
-    while(tb < te && ws(s[tb])) ++tb;
-    while(te > tb && ws(s[te-1])) --te;
-    if(te > tb)
-    {
-      std::string tok = s.substr(tb, te - tb);   // null-terminated for strtod
-      char* parse_end = nullptr;
-      double d = std::strtod(tok.c_str(), &parse_end);
-      if(parse_end != tok.c_str())               // parsed at least one digit
-        result.push_back(std::clamp(static_cast<int>(d), 0, 49));
-    }
-    if(comma == std::string::npos)
+    while(pos < s.size() && sep(s[pos]))   // skip separators (empty tokens are not an error)
+      ++pos;
+    if(pos >= s.size())
       break;
-    pos = comma + 1;
+    std::size_t te = pos;
+    while(te < s.size() && !sep(s[te]))
+      ++te;
+
+    const std::string tok{s.substr(pos, te - pos)};   // null-terminated for strtod
+    char* parse_end = nullptr;
+    const double d = std::strtod(tok.c_str(), &parse_end);
+    if(parse_end != tok.c_str() + tok.size())         // must consume the WHOLE token
+      return std::nullopt;
+    if(!std::isfinite(d))                             // inf / NaN: the cast below would be UB
+      return std::nullopt;
+
+    result.push_back(std::clamp(static_cast<int>(std::clamp(d, -1e9, 1e9)), 0, 49));
+    pos = te;
   }
   return result;
 }
@@ -1185,17 +1212,17 @@ bool StreamDiffusion::updateScheduler(const std::string& timestep_str)
     return false;
 
   auto timestep_indices = get_steps(timestep_str);
-  if (timestep_indices.empty())
+  if (!timestep_indices || timestep_indices->empty())
     return false;
 
   // For turbo models, only use first step
   if(m_config_state.model_type == MODEL_SDXL_TURBO
      || m_config_state.model_type == MODEL_SD_TURBO)
   {
-    timestep_indices.resize(1);
+    timestep_indices->resize(1);
   }
 
-  m_config_state.timestep_indices = std::move(timestep_indices);
+  m_config_state.timestep_indices = std::move(*timestep_indices);
   m_config_state.denoising_steps = m_config_state.timestep_indices.size();
 
   // Build scheduler arrays from precomputed tables
@@ -2226,8 +2253,18 @@ void StreamDiffusion::operator()()
   // Check for configuration changes that require pipeline recreation
   const auto prev_t1 = get_steps(m_prev_inputs.t1.value);
   const auto new_t1 = get_steps(in_config.t1.value);
-  const auto n_prev_t1 = prev_t1.size();
-  const auto n_new_t1 = new_t1.size();
+  if (!new_t1 || new_t1->empty())
+  {
+    // A typo is now distinguishable from an empty field, and both are REPORTED rather than
+    // leaving a silently dead node that re-enters the rebuild path on every tick.
+    std::fprintf(
+        stderr, "StreamDiffusion: Timesteps \"%s\" %s\n", in_config.t1.value.c_str(),
+        new_t1 ? "contains no step" : "could not be parsed");
+    noteSetupFailure(in_config);
+    return;
+  }
+  const auto n_prev_t1 = prev_t1 ? prev_t1->size() : std::size_t(0);
+  const auto n_new_t1 = new_t1->size();
   
   bool need_rebuild = false;
   bool need_update_scheduler = false;
@@ -2302,7 +2339,7 @@ void StreamDiffusion::operator()()
   // Create or reinit pipeline if needed
   if (need_rebuild || !m_cached_engine || !m_cached_engine->pipeline)
   {
-    if (!createConfiguration(in_config, new_t1))
+    if (!createConfiguration(in_config, *new_t1))
     {
       noteSetupFailure(in_config);
       return;
