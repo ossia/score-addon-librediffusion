@@ -2652,13 +2652,12 @@ void StreamDiffusion::operator()()
       break;
   }
 
-  if (!frame_ok)
-  {
-    this->outputs.image.texture.changed = false;
-    return;
-  }
-
-  this->outputs.image.texture.changed = true;
+  // Only PUBLICATION is conditional. m_prev_inputs is what every need_update_* comparison next tick
+  // is made against: leaving it stale on failure re-derives the whole configuration -- CLIP encode,
+  // device alloc/free, prepare_scheduler (which ends in a cudaStreamSynchronize) and a
+  // set_guidance_scale that discards the captured CUDA graph -- on EVERY tick, at score's rate. The
+  // setup back-off cannot stop it: noteSetupSuccess() has already run by the time inference fails.
+  this->outputs.image.texture.changed = frame_ok;
   m_prev_inputs = inputs;
 }
 
