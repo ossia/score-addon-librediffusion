@@ -338,12 +338,12 @@ void SDPipeline::reset()
   }
 }
 
-SDClip::SDClip(const char* engine_path)
+SDClip::SDClip(const char* engine_path, int device)
 {
   const auto& sd = sd::liblibrediffusion::instance();
   if (sd.available && engine_path)
   {
-    sd.clip_create(engine_path, 0, &m_handle);
+    sd.clip_create(engine_path, device, &m_handle);
   }
 }
 
@@ -800,25 +800,30 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
 
   if (need_new_engine)
   {
-    // Try to acquire from cache (key = model path + pipeline mode)
-    m_cached_engine = EngineCache::instance().acquire(in_config.model.value, pipeline_mode);
+    // Try to acquire from cache (key = model path + pipeline mode + device).
+    // m_config_state is not repopulated until further down, so anything that starts driving
+    // .device from a port must set it BEFORE this lookup or the entry is matched on the previous
+    // device.
+    m_cached_engine = EngineCache::instance().acquire(
+        in_config.model.value, pipeline_mode, m_config_state.device);
 
     if (!m_cached_engine)
     {
       auto new_engine = std::make_unique<CachedEngine>();
       new_engine->model_path = in_config.model.value;
       new_engine->pipeline_mode = pipeline_mode;
+      new_engine->device = m_config_state.device;
 
       // Create CLIP encoders
       std::string clip1_path = in_config.model.value + "/clip.engine";
-      new_engine->clip1 = new SDClip{clip1_path.c_str()};
+      new_engine->clip1 = new SDClip{clip1_path.c_str(), m_config_state.device};
       if (!*new_engine->clip1)
         return false;
 
       if(model_type == MODEL_SDXL_TURBO)
       {
         std::string clip2_path = in_config.model.value + "/clip2.engine";
-        new_engine->clip2 = new SDClip{clip2_path.c_str()};
+        new_engine->clip2 = new SDClip{clip2_path.c_str(), m_config_state.device};
         if (!*new_engine->clip2)
           return false;
       }
@@ -839,7 +844,7 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
   if (model_type == MODEL_SDXL_TURBO && m_cached_engine && !m_cached_engine->clip2)
   {
     std::string clip2_path = in_config.model.value + "/clip2.engine";
-    auto* clip2 = new SDClip{clip2_path.c_str()};
+    auto* clip2 = new SDClip{clip2_path.c_str(), m_config_state.device};
     if (!*clip2)
     {
       std::fprintf(stderr, "StreamDiffusion: SDXL workflow but %s could not be loaded\n",
@@ -958,7 +963,7 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
   };
 
   // Apply settings via C API
-  m_sd.config_set_device(config.get(), 0);
+  m_sd.config_set_device(config.get(), m_config_state.device);
   m_sd.config_set_model_type(config.get(), model_type);
   m_sd.config_set_pipeline_mode(config.get(), pipeline_mode);
   if (!accepted(
@@ -1951,7 +1956,7 @@ void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
     }
     // CLIP encoder so the embedding can be derived from the Prompt (sd-turbo, pad 0, dim 1024).
     const std::string clip = in_config.model.value + "/clip.engine";
-    m_i2it_clip = SDClip{clip.c_str()};
+    m_i2it_clip = SDClip{clip.c_str(), m_config_state.device};
     m_i2it_embeddings.reset();
     m_i2it_prompt.clear();
   }

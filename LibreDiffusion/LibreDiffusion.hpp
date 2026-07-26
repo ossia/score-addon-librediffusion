@@ -71,7 +71,7 @@ class SDClip
 {
 public:
   SDClip() = default;
-  explicit SDClip(const char* engine_path);
+  SDClip(const char* engine_path, int device);
   ~SDClip();
   SDClip(const SDClip&) = delete;
   SDClip& operator=(const SDClip&) = delete;
@@ -186,6 +186,7 @@ struct SDConfigState
   bool do_add_noise{true};
   bool use_denoising_batch{false};
   int cfg_type{2};
+  int device{0};
   int text_seq_len{77};
   int text_hidden_dim{768};
   int clip_pad_token{49407};
