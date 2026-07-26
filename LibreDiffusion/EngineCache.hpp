@@ -14,7 +14,9 @@ struct CachedEngine
 {
   std::string model_path;
   int pipeline_mode{0};  // sd_pipeline_mode_t: 0=SINGLE_FRAME, 1=TEMPORAL_V2V
-  bool denoising_batch{};
+  // The entry owns a pipeline and its CLIPs, which are all bound to one CUDA device, so an entry
+  // built for one device cannot serve another.
+  int device{0};
   SDPipeline* pipeline{};
   SDClip* clip1{};
   SDClip* clip2{};  // Only for SDXL
@@ -33,7 +35,7 @@ class EngineCache
 public:
   static EngineCache& instance();
 
-  CachedEngine* acquire(const std::string& model_path, int pipeline_mode);
+  CachedEngine* acquire(const std::string& model_path, int pipeline_mode, int device);
   CachedEngine* store(std::unique_ptr<CachedEngine> engine);
   void release(CachedEngine* engine);
   void clear();

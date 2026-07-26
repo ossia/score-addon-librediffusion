@@ -15,6 +15,7 @@ CachedEngine::~CachedEngine()
 CachedEngine::CachedEngine(CachedEngine&& other) noexcept
     : model_path{std::move(other.model_path)}
     , pipeline_mode{other.pipeline_mode}
+    , device{other.device}
     , pipeline{other.pipeline}
     , clip1{other.clip1}
     , clip2{other.clip2}
@@ -35,6 +36,7 @@ CachedEngine& CachedEngine::operator=(CachedEngine&& other) noexcept
 
     model_path = std::move(other.model_path);
     pipeline_mode = other.pipeline_mode;
+    device = other.device;
     pipeline = other.pipeline;
     clip1 = other.clip1;
     clip2 = other.clip2;
@@ -53,14 +55,15 @@ EngineCache& EngineCache::instance()
   return cache;
 }
 
-CachedEngine* EngineCache::acquire(const std::string& model_path, int pipeline_mode)
+CachedEngine* EngineCache::acquire(
+    const std::string& model_path, int pipeline_mode, int device)
 {
   std::lock_guard lock{m_mutex};
 
   for (auto& engine : m_engines)
   {
     if (!engine->in_use && engine->model_path == model_path
-        && engine->pipeline_mode == pipeline_mode)
+        && engine->pipeline_mode == pipeline_mode && engine->device == device)
     {
       engine->in_use = true;
       return engine.get();
