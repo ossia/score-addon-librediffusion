@@ -343,7 +343,7 @@ SDClip::SDClip(const char* engine_path)
   const auto& sd = sd::liblibrediffusion::instance();
   if (sd.available && engine_path)
   {
-    sd.clip_create(engine_path, &m_handle);
+    sd.clip_create(engine_path, 0, &m_handle);
   }
 }
 
@@ -390,7 +390,7 @@ SDFluxStream::SDFluxStream(
   if (sd.available && sd.flux2_stream_create)
   {
     m_handle = sd.flux2_stream_create(
-        transformer, qwen, vae_decoder, vae_encoder, tokenizer_json, Th, Tw, seed);
+        transformer, qwen, vae_decoder, vae_encoder, tokenizer_json, Th, Tw, seed, 0);
   }
 }
 
@@ -432,7 +432,7 @@ SDRife::SDRife(const char* engine_path)
   const auto& sd = sd::liblibrediffusion::instance();
   if (sd.available && sd.rife_create && engine_path)
   {
-    m_handle = sd.rife_create(engine_path);
+    m_handle = sd.rife_create(engine_path, 0);
   }
 }
 
@@ -474,7 +474,7 @@ SDImg2ImgTurbo::SDImg2ImgTurbo(
 {
   const auto& sd = sd::liblibrediffusion::instance();
   if (sd.available && sd.img2img_turbo_create)
-    m_handle = sd.img2img_turbo_create(unet, vae_encoder, vae_decoder);
+    m_handle = sd.img2img_turbo_create(unet, vae_encoder, vae_decoder, 0);
 }
 
 SDImg2ImgTurbo::~SDImg2ImgTurbo()
