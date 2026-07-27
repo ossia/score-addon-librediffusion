@@ -33,11 +33,18 @@ P = dict(workflow=4, prompt=5, negative=6, engines=7, seed=8, guidance=9, timest
 
 CFG_NONE, CFG_SELF, CFG_FULL, CFG_INIT = 0, 1, 2, 3
 
-# Validated start-index schedules. txt2img starts from pure noise (idx 0); img2img starts mid-schedule
-# so the encoded frame survives -- idx ~32 is where 1-2 LCM steps stay sharp AND content-preserving
-# (SETTINGS_GUIDELINES.md). Multi-step lists match the golden matrix / captured clip sidecars.
+# Start-index schedules. Mode matters, and the golden matrix cannot be used directly here: its cells
+# exist to compare C++ against Python at the same settings, so it uses one schedule for both modes.
+# Measured in score: a txt2img start of 32 leaves the latent under-noised and renders confetti, while
+# an img2img start of 0 is ~pure noise (beta[0] ~= 1) and wipes the input frame. So txt2img starts at
+# 0 and img2img mid-schedule -- except SDXS, which is distilled to jump from t999 and renders a
+# featureless blur at 32 (A/B: t0 sharp, t20/t32 mush, with and without cfg-self).
+# The img2img schedules stay inside the late band: every step before ~32 erodes the encoded frame,
+# so a 4-step list starting at 16 renders a featureless gradient while the same 4 steps over 32..45
+# keep the scene (measured on lcm-dreamshaper 4step; denoise-batch on/off makes no difference).
 T2I_SCHED = {1: "0", 2: "0, 25", 3: "0, 16, 33", 4: "0, 12, 25, 37"}
-I2I_SCHED = {1: "32", 2: "32, 45", 3: "20, 30, 40", 4: "16, 24, 32, 40"}
+I2I_SCHED = {1: "32", 2: "32, 45", 3: "32, 39, 45", 4: "32, 37, 42, 45"}
+I2I_OVERRIDE = {"sdxs": {1: "0"}}
 
 PROMPTS = {
     "t2i": ("a red fox in a snowy forest, oil painting, highly detailed", "low quality, blurry"),
@@ -113,7 +120,7 @@ def bundle_profile(d):
 problems = []
 
 
-def preset(name, engines, workflow, *, steps=1, res=(512, 512), mode="t2i", timesteps=None,
+def preset(name, engines, workflow, *, steps=1, res=(512, 512), mode="t2i", sched=None, timesteps=None,
            cfg=None, guidance=None, add_noise=None, denoise_batch=None, cn_scale=1.0,
            ip_scale=0.7, lora_scale=1.0, klein_quality=0, rife_exp=0, is_async=False, pacing=0,
            prompt_key=None, seed=42, delta=1.0, check=True):
@@ -142,15 +149,16 @@ def preset(name, engines, workflow, *, steps=1, res=(512, 512), mode="t2i", time
                     return None
 
     is_i2i = mode in ("i2i", "cn_restyle", "ip_i2i")
-    honours_cfg = workflow in (SD_T2I, SD_I2I, SD_T2I_CN, SD_I2I_CN, SD_T2I_IP, SD_I2I_IP)
     if timesteps is None:
-        timesteps = (I2I_SCHED if is_i2i else T2I_SCHED)[steps]
+        table = I2I_SCHED if is_i2i else T2I_SCHED
+        if is_i2i and sched in I2I_OVERRIDE and steps in I2I_OVERRIDE[sched]:
+            timesteps = I2I_OVERRIDE[sched][steps]
+        else:
+            timesteps = table[steps]
     if cfg is None:
-        cfg = CFG_SELF if (is_i2i and honours_cfg) else CFG_NONE
+        cfg = CFG_NONE
     if guidance is None:
-        guidance = 1.2 if (is_i2i and honours_cfg) else 1.0
-    if not honours_cfg:
-        cfg, guidance = CFG_NONE, 1.0
+        guidance = 1.0
     if add_noise is None:
         add_noise = not is_i2i
     if denoise_batch is None:
@@ -197,21 +205,21 @@ def build():
 
     # ---- SD1.5 family: 768-dim CLIP, pad 49407, cfg + denoise-batch honoured from the ports.
     sd15 = [
-        ("SD15 SDXS 512",            f"{E}/44549d33ab82fefb", 1, (512, 512)),
-        ("SD15 Hyper-SD 1step",      f"{E}/32fde15b1bc3abf8", 1, (512, 512)),
-        ("SD15 Hyper-SD 2step",      f"{E}/a93990bd296e3fe9", 2, (512, 512)),
-        ("SD15 Hyper-SD 4step",      f"{E}/c049cd0e1923be58", 4, (512, 512)),
-        ("SD15 LCM Dreamshaper 2step", f"{E}/611a46b8d791e296", 2, (512, 512)),
-        ("SD15 LCM Dreamshaper 4step", f"{E}/5df487d86a94d462", 4, (512, 512)),
-        ("SD21 base 1step",  "/media/data1/lrd-benchmark/engines/sd21-base-1step", 1, (512, 512)),
-        ("SD21 base 4step",  "/media/data1/lrd-benchmark/engines/sd21-base-4step", 4, (512, 512)),
+        ("SD15 SDXS 512",            f"{E}/44549d33ab82fefb", 1, (512, 512), "sdxs"),
+        ("SD15 Hyper-SD 1step",      f"{E}/32fde15b1bc3abf8", 1, (512, 512), "hyper-sd15"),
+        ("SD15 Hyper-SD 2step",      f"{E}/a93990bd296e3fe9", 2, (512, 512), "hyper-sd15"),
+        ("SD15 Hyper-SD 4step",      f"{E}/c049cd0e1923be58", 4, (512, 512), "hyper-sd15"),
+        ("SD15 LCM Dreamshaper 2step", f"{E}/611a46b8d791e296", 2, (512, 512), "lcm"),
+        ("SD15 LCM Dreamshaper 4step", f"{E}/5df487d86a94d462", 4, (512, 512), "lcm"),
+        ("SD21 base 1step",  "/media/data1/lrd-benchmark/engines/sd21-base-1step", 1, (512, 512), "sd21"),
+        ("SD21 base 4step",  "/media/data1/lrd-benchmark/engines/sd21-base-4step", 4, (512, 512), "sd21"),
     ]
-    for name, eng, steps, res in sd15:
+    for name, eng, steps, res, sch in sd15:
         db = steps > 1          # 1.45x at 2 steps / 1.6x at 4, and it costs no extra VRAM
         made += [preset(f"{name} txt2img", eng, SD_T2I, steps=steps, res=res, mode="t2i",
-                        denoise_batch=db),
+                        sched=sch, denoise_batch=db),
                  preset(f"{name} img2img", eng, SD_I2I, steps=steps, res=res, mode="i2i",
-                        denoise_batch=db)]
+                        sched=sch, denoise_batch=db)]
 
     # ---- SD-Turbo: 1024-dim CLIP, pad 0, single-step by construction (the node forces both).
     for name, eng, res in [
@@ -220,29 +228,31 @@ def build():
         ("SD-Turbo 768x512",  f"{E}/1550845aa0f77668", (768, 512)),
         ("SD-Turbo 768",      f"{E}/fcf0c5cde3f4ee27", (768, 768)),
     ]:
-        made += [preset(f"{name} txt2img", eng, TURBO_T2I, steps=1, res=res, mode="t2i"),
-                 preset(f"{name} img2img", eng, TURBO_I2I, steps=1, res=res, mode="i2i")]
+        made += [preset(f"{name} txt2img", eng, TURBO_T2I, steps=1, res=res, mode="t2i",
+                        sched="sd-turbo"),
+                 preset(f"{name} img2img", eng, TURBO_I2I, steps=1, res=res, mode="i2i",
+                        sched="sd-turbo")]
 
     # ---- SDXL family: 2048-dim CLIP + clip2, pooled embeds. The node pins cfg-none/guidance 0 on
     # this path, so the img2img presets cannot use the cfg-self restyle recipe.
     sdxl = [
-        ("SDXL Turbo 512",           f"{E}/b34b954f2133d4f0", 1, (512, 512)),
-        ("SDXL Turbo 1024",          f"{E}/b7ee298aa818aa51", 1, (1024, 1024)),
-        ("SDXL Hyper-SD 4step",      f"{E}/847eb1390454cf93", 4, (1024, 1024)),
-        ("SDXL Lightning 4step",     f"{E}/c8d002f4bf80148a", 4, (1024, 1024)),
-        ("SDXL LCM-LoRA 2step",      f"{E}/d652fc8897e4587c", 2, (1024, 1024)),
-        ("SDXL LCM-LoRA 2step 512",  f"{E}/f5a48e2ed23d671c", 2, (512, 512)),
-        ("SDXL LCM-LoRA 3step",      f"{E}/0f1da52837e59afa", 3, (1024, 1024)),
-        ("SDXL LCM-LoRA 4step",      f"{E}/40ddf8ec5cec3718", 4, (1024, 1024)),
-        ("SDXL Segmind VegaRT 2step", "/media/data1/lrd-engines/vega", 2, (1024, 1024)),
+        ("SDXL Turbo 512",           f"{E}/b34b954f2133d4f0", 1, (512, 512), "sdxl-turbo"),
+        ("SDXL Turbo 1024",          f"{E}/b7ee298aa818aa51", 1, (1024, 1024), "sdxl-turbo"),
+        ("SDXL Hyper-SD 4step",      f"{E}/847eb1390454cf93", 4, (1024, 1024), "sdxl-4step"),
+        ("SDXL Lightning 4step",     f"{E}/c8d002f4bf80148a", 4, (1024, 1024), "sdxl-4step"),
+        ("SDXL LCM-LoRA 2step",      f"{E}/d652fc8897e4587c", 2, (1024, 1024), "sdxl-lcm"),
+        ("SDXL LCM-LoRA 2step 512",  f"{E}/f5a48e2ed23d671c", 2, (512, 512), "sdxl-lcm"),
+        ("SDXL LCM-LoRA 3step",      f"{E}/0f1da52837e59afa", 3, (1024, 1024), "sdxl-lcm"),
+        ("SDXL LCM-LoRA 4step",      f"{E}/40ddf8ec5cec3718", 4, (1024, 1024), "sdxl-lcm"),
+        ("SDXL Segmind VegaRT 2step", "/media/data1/lrd-engines/vega", 2, (1024, 1024), "vega"),
     ]
-    for name, eng, steps, res in sdxl:
+    for name, eng, steps, res, sch in sdxl:
         slow = res[0] >= 1024      # ~9-17 fps at 1024: diffuse off the render thread
         db = steps > 1             # the form the multi-step SDXL goldens were produced with
         made += [preset(f"{name} txt2img", eng, SDXL_T2I, steps=steps, res=res, mode="t2i",
-                        cfg=CFG_NONE, guidance=1.0, denoise_batch=db, is_async=slow),
+                        sched=sch, denoise_batch=db, is_async=slow),
                  preset(f"{name} img2img", eng, SDXL_I2I, steps=steps, res=res, mode="i2i",
-                        cfg=CFG_NONE, guidance=1.0, denoise_batch=db, is_async=slow)]
+                        sched=sch, denoise_batch=db, is_async=slow)]
 
     # ---- ControlNet. Preprocessing is EXTERNAL: feed an already-extracted canny/depth/pose/softedge
     # map into "Control / Style". txt2img+CN reinvents from the structure, img2img+CN restyles the
@@ -256,24 +266,27 @@ def build():
         ("SDXS ControlNet Sketch (portable)", "/media/data2/cn-sdxs-sketch-portable/engines"),
     ]
     for name, eng in cn_sd15:
-        made += [preset(f"{name} reinvent", eng, SD_T2I_CN, steps=1, res=(512, 512),
+        sch = "sdxs" if name.startswith("SDXS") else "controlnet-sd15"
+        made += [preset(f"{name} reinvent", eng, SD_T2I_CN, steps=1, res=(512, 512), sched=sch,
                         mode="t2i", prompt_key="cn_reinvent", check=False),
-                 preset(f"{name} restyle", eng, SD_I2I_CN, steps=1, res=(512, 512),
+                 preset(f"{name} restyle", eng, SD_I2I_CN, steps=1, res=(512, 512), sched=sch,
                         mode="i2i", prompt_key="cn_restyle", check=False)]
     for name, eng in [("SDXL ControlNet Canny", "/media/data2/cn-sdxl-test/engines"),
                       ("SDXL ControlNet OpenPose", "/media/data2/cn-sdxl-openpose/engines")]:
         made += [preset(f"{name} reinvent", eng, SDXL_T2I_CN, steps=1, res=(1024, 1024),
-                        mode="t2i", cfg=CFG_NONE, guidance=1.0, prompt_key="cn_reinvent",
+                        mode="t2i", sched="sdxl-turbo", prompt_key="cn_reinvent",
                         is_async=False, check=False),
                  preset(f"{name} restyle", eng, SDXL_I2I_CN, steps=1, res=(1024, 1024),
-                        mode="i2i", cfg=CFG_NONE, guidance=1.0, prompt_key="cn_restyle",
+                        mode="i2i", sched="sdxl-turbo", prompt_key="cn_restyle",
                         is_async=False, check=False)]
 
     # ---- IP-Adapter: the style image goes on the "Control / Style" inlet and is encoded on-device.
     made += [preset("SD15 IP-Adapter txt2img", "/media/data2/ip-sd15-test/engines", SD_T2I_IP,
-                    steps=1, res=(512, 512), mode="t2i", prompt_key="ip", check=False),
+                    steps=1, res=(512, 512), mode="t2i", sched="ipadapter-sd15",
+                    prompt_key="ip", check=False),
              preset("SD15 IP-Adapter img2img", "/media/data2/ip-sd15-test/engines", SD_I2I_IP,
-                    steps=1, res=(512, 512), mode="i2i", prompt_key="ip", check=False)]
+                    steps=1, res=(512, 512), mode="i2i", sched="ipadapter-sd15",
+                    prompt_key="ip", check=False)]
 
     # ---- FLUX.2-klein. Timesteps here is a FlowMatch sigma list, not SD indices; the SD-style
     # default leaves the model on its native 2-step schedule, which is what the demos used.
@@ -288,9 +301,9 @@ def build():
     made += [preset("FLUX2 Klein inpaint", K, KLEIN_INPAINT, steps=1, res=(320, 576), mode="i2i",
                     timesteps="15, 25", prompt_key="klein", klein_quality=0, rife_exp=0,
                     is_async=True, check=False),
-             preset("FLUX2 Klein landscape", K, KLEIN_I2I, steps=1, res=(576, 320), mode="i2i",
-                    timesteps="15, 25", prompt_key="klein", klein_quality=1, rife_exp=2,
-                    is_async=True, check=False)]
+             preset("FLUX2 Klein landscape", "/media/data1/klein-landscape", KLEIN_I2I, steps=1,
+                    res=(576, 320), mode="i2i", timesteps="15, 25", prompt_key="klein",
+                    klein_quality=1, rife_exp=2, is_async=True, check=False)]
 
     # ---- img2img-turbo (skip-VAE pix2pix-turbo): geometry and step count come from the engine.
     for name, eng in [("img2img-turbo edge2image", "/media/data1/img2img-turbo/bundle-traintest"),
@@ -300,7 +313,7 @@ def build():
 
     # ---- runtime-LoRA demo: engine exported with --lora PATH:runtime, so LoRA scale is live.
     made += [preset("SDXL crayon runtime-LoRA txt2img", "/media/data1/lora-test/crayon-rt",
-                    SDXL_T2I, steps=1, res=(1024, 1024), mode="t2i", cfg=CFG_NONE, guidance=1.0,
+                    SDXL_T2I, steps=1, res=(1024, 1024), mode="t2i", sched="sdxl-turbo",
                     lora_scale=1.0, is_async=True)]
 
     return [m for m in made if m]
