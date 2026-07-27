@@ -35,6 +35,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <string_view>
 #include <system_error>
@@ -238,6 +239,41 @@ static bool is_controlnet_workflow(int8_t wf) noexcept
     default:
       return false;
   }
+}
+
+// Cross-attention width declared by a bundle's manifest, or 0 when there is no usable manifest.
+// The SD1.5 family is not one width: SD1.5 is 768, SD2.1 is 1024, and the workflow enum cannot tell
+// them apart. Exporter-written bundle.json carries it; the pre-manifest hash bundles do not, and
+// those fall back to the per-model-type default. Deliberately a scan and not a JSON parse -- one
+// integer out of a file we generate ourselves does not justify a dependency the SDK / JIT /
+// standalone builds would also have to carry.
+static int bundle_embedding_dim(const std::string& model_dir)
+{
+  std::ifstream f{model_dir + "/bundle.json", std::ios::binary};
+  if(!f)
+    return 0;
+  const std::string text{
+      std::istreambuf_iterator<char>{f}, std::istreambuf_iterator<char>{}};
+
+  const auto key = text.find("\"embedding_dim\"");
+  if(key == std::string::npos)
+    return 0;
+  auto p = text.find(':', key);
+  if(p == std::string::npos)
+    return 0;
+  ++p;
+  while(p < text.size() && (text[p] == ' ' || text[p] == '\t'))
+    ++p;
+  int dim = 0;
+  const auto begin = p;
+  while(p < text.size() && text[p] >= '0' && text[p] <= '9')
+  {
+    dim = dim * 10 + (text[p] - '0');
+    if(dim > 65536)   // nonsense manifest: ignore it rather than propagate a huge allocation
+      return 0;
+    ++p;
+  }
+  return p > begin ? dim : 0;
 }
 
 SDConfig::SDConfig()
@@ -910,9 +946,14 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
   }
   else if(model_type == MODEL_SDXL_TURBO)
   {
-    m_config_state.use_denoising_batch = false;
+    // Inert at one step; the multi-step SDXL bundles below need it, since the batched form is the
+    // one their goldens were produced with (every multi-step img2img golden cell is `batch-1`).
+    m_config_state.use_denoising_batch = in_config.denoise_batch;
     m_config_state.do_add_noise = in_config.add_noise;
-    m_config_state.denoising_steps = 1;
+    // MODEL_SDXL_TURBO is the whole SDXL family here, not just sdxl-turbo: Hyper-SDXL /
+    // SDXL-Lightning / LCM-LoRA-SDXL / Segmind-VegaRT are multi-step, so keep the step count the
+    // Timesteps port asked for. The engine's batch profile is what actually constrains it (a static
+    // b1-1 bundle rejects >1 at init).
     m_config_state.cfg_type = 0;
     m_config_state.delta = in_config.delta;
     m_config_state.guidance_scale = 0.0f;
@@ -945,6 +986,9 @@ bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::
     m_config_state.text_seq_len = 77;
     m_config_state.text_hidden_dim = 768;
     m_config_state.clip_pad_token = 49407;
+    // SD2.1 shares this path but encodes to 1024. Take the manifest's width when it declares one.
+    if(const int dim = bundle_embedding_dim(in_config.model.value); dim > 0)
+      m_config_state.text_hidden_dim = dim;
   }
 
   // Create config handle for pipeline
@@ -1241,9 +1285,8 @@ bool StreamDiffusion::updateScheduler(const std::string& timestep_str)
   if (!timestep_indices || timestep_indices->empty())
     return false;
 
-  // For turbo models, only use first step
-  if(m_config_state.model_type == MODEL_SDXL_TURBO
-     || m_config_state.model_type == MODEL_SD_TURBO)
+  // sd-turbo is genuinely single-step; SDXL is not (see createConfiguration).
+  if(m_config_state.model_type == MODEL_SD_TURBO)
   {
     timestep_indices->resize(1);
   }
