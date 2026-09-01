@@ -1,23 +1,21 @@
 /**
- * LibreDiffusion - Ported to StreamDiffusion C API via dynamic loading
+ * StreamDiffusion node: drives the librediffusion C API (loaded at runtime) for every model
+ * family through one frame pipeline. Per tick the render thread turns the inputs into an AsyncJob;
+ * produceFrame() renders it (+ RIFE) either inline (sync) or on the producer thread (Async).
  */
 
 #include "LibreDiffusion.hpp"
 
 #include "EngineCache.hpp"
+#include "ModelBuilder.hpp"
 #include "schedulers/lcm_dreamshaper_v7.hpp"
 #include "schedulers/sd-turbo.hpp"
 #include "schedulers/sdxl-turbo.hpp"
 
-#if __has_include(<ossia/detail/fmt.hpp>)
-#include <ossia/detail/fmt.hpp>
-#endif
 #include <boost/container/small_vector.hpp>
 
-// rapidhash is a libossia 3rdparty single-header. Use the host's copy when it
-// is on the include path (score dev build), otherwise the vendored copy so SDK
-// / JIT / standalone builds -- which do not expose libossia's 3rdparty include
-// dirs -- still compile.
+// rapidhash is a libossia 3rdparty single-header. Use the host's copy when it is on the include
+// path (score dev build), otherwise the vendored copy.
 #if __has_include(<rapidhash.h>)
 #include <rapidhash.h>
 #else
@@ -29,70 +27,64 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <system_error>
-#include <ranges>
 
 namespace
 {
-// Monotonic wall-clock seconds for the Phase-C steady render phase (decoupled from score's tick rate).
+// Monotonic wall-clock seconds for the paced presentation (independent of the host's tick rate).
 inline double now_s_steady()
 {
-  return std::chrono::duration<double>(
-             std::chrono::steady_clock::now().time_since_epoch())
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
 
-// Non-throwing std::filesystem::exists. The throwing overload only swallows ENOENT/ENOTDIR; a
-// symlink loop, an unreadable parent or a dead mount raises filesystem_error, and score's render
-// path has no try/catch around operator(). Anything we cannot stat is simply "not there".
+// Non-throwing std::filesystem::exists: a symlink loop, an unreadable parent or a dead mount raises
+// filesystem_error, and the host's render path has no try/catch around operator().
 inline bool file_exists(const std::string& p) noexcept
 {
   std::error_code ec;
   return std::filesystem::exists(p, ec) && !ec;
 }
 
-// Upper bound for the Resolution port. The spinbox range is 64..2048, but a preset, an automation
-// curve or a remote parameter can deliver anything, and halp's texture create() computes
-// `width * height * bytes_per_pixel` with the width*height product in `int`.
+inline uint64_t hash_bytes(const void* p, size_t n) noexcept
+{
+  return n ? rapidhash(p, n) : 0;
+}
+
+// Upper bound for the Resolution port: a preset or an automation can deliver anything, and halp's
+// texture create() computes width * height * 4 in `int`.
 constexpr int k_max_resolution = 8192;
 }
 
-// Prompt interpolation
+// -------------------------------------------------------------------------------------------------
+// Prompt language: "(some text: 0.1), (other text: 0.5)" -> weighted sub-prompts blended in
+// embedding space.
+// -------------------------------------------------------------------------------------------------
 namespace lo
 {
-
 struct WeightedPromptElement
 {
   std::string text;
   double value;
 };
 
-/**
- * Small parser for the following prompt language:
- *
- * (some text, 0.1), (other text, 0.5), (blablabla, 1)
- */
-std::optional<std::vector<WeightedPromptElement>>
-parse_input_string(std::string_view str);
-
+std::optional<std::vector<WeightedPromptElement>> parse_input_string(std::string_view str);
 }
 
-BOOST_FUSION_ADAPT_STRUCT(
-    lo::WeightedPromptElement,
-    (std::string, text)(double, value))
+BOOST_FUSION_ADAPT_STRUCT(lo::WeightedPromptElement, (std::string, text)(double, value))
 
 namespace lo
 {
-
 namespace x3 = boost::spirit::x3;
 
 struct TextContentTag;
@@ -102,10 +94,8 @@ struct DataListTag;
 
 const x3::rule<TextContentTag, std::string> text_content = "text_content";
 const x3::rule<NumberTag, double> number = "number";
-const x3::rule<WeightedPromptElementTag, WeightedPromptElement> data_item
-    = "data_item";
-const x3::rule<DataListTag, std::vector<WeightedPromptElement>> data_list
-    = "data_list";
+const x3::rule<WeightedPromptElementTag, WeightedPromptElement> data_item = "data_item";
+const x3::rule<DataListTag, std::vector<WeightedPromptElement>> data_list = "data_list";
 
 auto const text_content_def = x3::lexeme[*(x3::char_ - ':')];
 auto const number_def = x3::double_;
@@ -114,68 +104,57 @@ auto const data_list_def = data_item % ',';
 
 BOOST_SPIRIT_DEFINE(text_content, number, data_item, data_list);
 
-// Blend weights are multiplied into every element of the conditioning tensor and are narrowed to
-// float on the way to blend_embeds, so anything beyond this is either a typo or an overflow.
+// Blend weights multiply every element of the conditioning tensor and are narrowed to float on
+// the way to blend_embeds, so anything beyond this is either a typo or an overflow.
 constexpr double k_max_prompt_weight = 1e6;
 
-std::optional<std::vector<WeightedPromptElement>>
-parse_input_string(std::string_view str)
+std::optional<std::vector<WeightedPromptElement>> parse_input_string(std::string_view str)
 {
   std::vector<WeightedPromptElement> result_data;
   auto iterator = str.begin();
   auto const end_iterator = str.end();
 
-  const auto success = x3::phrase_parse(
-      iterator, end_iterator, data_list, x3::ascii::space, result_data);
-
-  if (!(success && iterator == end_iterator))
+  const auto success
+      = x3::phrase_parse(iterator, end_iterator, data_list, x3::ascii::space, result_data);
+  if(!(success && iterator == end_iterator))
     return std::nullopt;
 
-  for (auto& e : result_data)
+  for(auto& e : result_data)
   {
-    // x3::double_ parses "nan" and "inf" happily, and a merely huge weight becomes +/-inf when
-    // narrowed to the float blend_embeds takes; either poisons the whole conditioning tensor.
-    if (!std::isfinite(e.value) || std::abs(e.value) > k_max_prompt_weight)
+    // x3::double_ parses "nan" and "inf", and a huge weight becomes inf once narrowed to float.
+    if(!std::isfinite(e.value) || std::abs(e.value) > k_max_prompt_weight)
       return std::nullopt;
-
-    // `*(char_ - ':')` accepts '\0' as an ordinary character, so text.size() can exceed
-    // strlen(c_str()) -- and every consumer reaches CLIP through c_str().
+    // `*(char_ - ':')` accepts '\0', and every consumer reaches CLIP through c_str().
     std::erase(e.text, '\0');
   }
-
   return result_data;
 }
 
-}
-
-namespace lo
-{
 // Parse the "Timesteps" control into scheduler indices (slots in a 50-entry table).
 //
 // Returns a (possibly empty) list when the string was understood -- empty means "nothing typed
-// yet" -- and std::nullopt when it holds something that is not a usable index.
-//
-// Separators are commas AND whitespace, so "1 2 3" is three steps. A token must parse COMPLETELY
-// ("12abc" is an error, not a silent 12), and a non-finite value is rejected rather than reaching
-// static_cast<int>, which is UB outside int's range. Finite out-of-range values are clamped into
-// [0, 49], and "[15, 25]" is tolerated.
+// yet" -- and std::nullopt when it holds something that is not a usable index. Separators are
+// commas and whitespace; a token must parse completely; non-finite values are rejected; finite
+// out-of-range values are clamped into [0, 49]; "[15, 25]" is tolerated.
 static std::optional<std::vector<int>> get_steps(std::string_view in)
 {
-  auto ws = [](unsigned char c){ return c==' '||c=='\t'||c=='\n'||c=='\r'; };
-  auto sep = [&](unsigned char c){ return ws(c) || c == ','; };
+  auto ws = [](unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+  auto sep = [&](unsigned char c) { return ws(c) || c == ','; };
 
   std::size_t b = 0, e = in.size();
-  while(b < e && ws(in[b])) ++b;
-  while(e > b && ws(in[e-1])) --e;
+  while(b < e && ws(in[b]))
+    ++b;
+  while(e > b && ws(in[e - 1]))
+    --e;
   std::string_view s = in.substr(b, e - b);
-  if(s.size() >= 2 && s.front() == '[' && s.back() == ']')   // tolerate "[a, b]"
+  if(s.size() >= 2 && s.front() == '[' && s.back() == ']')
     s = s.substr(1, s.size() - 2);
 
   std::vector<int> result;
   std::size_t pos = 0;
   while(pos < s.size())
   {
-    while(pos < s.size() && sep(s[pos]))   // skip separators (empty tokens are not an error)
+    while(pos < s.size() && sep(s[pos]))
       ++pos;
     if(pos >= s.size())
       break;
@@ -183,12 +162,12 @@ static std::optional<std::vector<int>> get_steps(std::string_view in)
     while(te < s.size() && !sep(s[te]))
       ++te;
 
-    const std::string tok{s.substr(pos, te - pos)};   // null-terminated for strtod
+    const std::string tok{s.substr(pos, te - pos)};
     char* parse_end = nullptr;
     const double d = std::strtod(tok.c_str(), &parse_end);
-    if(parse_end != tok.c_str() + tok.size())         // must consume the WHOLE token
+    if(parse_end != tok.c_str() + tok.size())
       return std::nullopt;
-    if(!std::isfinite(d))                             // inf / NaN: the cast below would be UB
+    if(!std::isfinite(d))
       return std::nullopt;
 
     result.push_back(std::clamp(static_cast<int>(std::clamp(d, -1e9, 1e9)), 0, 49));
@@ -197,63 +176,40 @@ static std::optional<std::vector<int>> get_steps(std::string_view in)
   return result;
 }
 
-// Parse the Timesteps control as klein/FLUX FlowMatch sigmas (native scale): comma-separated floats,
-// high->low, each in (0,1]. Returns {} if any value is out of (0,1] (e.g. the SD-style "15, 25" default),
-// signalling the caller to fall back to the model's natural 2-step schedule. Used only for klein bundles.
-static std::vector<float> get_sigmas(std::string s)
+// Parse the Timesteps control as FLUX FlowMatch sigmas (native scale): comma-separated floats,
+// high -> low, each in (0, 1]. Empty when the field is not a sigma list (e.g. the SD-style
+// "15, 25" default), which means "the model's natural 2-step schedule".
+static std::vector<float> get_sigmas(const std::string& s)
 {
   std::vector<float> out;
   std::size_t i = 0;
   while(i < s.size())
   {
     std::size_t j = s.find(',', i);
-    if(j == std::string::npos) j = s.size();
-    std::string tok = s.substr(i, j - i);
-    try {
-      std::size_t pos = 0;
-      float v = std::stof(tok, &pos);
-      if(pos > 0) out.push_back(v);
-    } catch(...) { /* skip non-numeric token */ }
+    if(j == std::string::npos)
+      j = s.size();
+    const std::string tok = s.substr(i, j - i);
+    char* end = nullptr;
+    const float v = std::strtof(tok.c_str(), &end);
+    if(end != tok.c_str())
+      out.push_back(v);
     i = j + 1;
   }
-  // Validate as sigmas: non-empty and every entry in (0,1]. Otherwise it's not a klein schedule.
-  if(out.empty()) return {};
-  for(float v : out) if(v <= 0.f || v > 1.f) return {};
+  for(float v : out)
+    if(!(v > 0.f && v <= 1.f))
+      return {};
   return out;
 }
 
-// True for every workflow that drives a ControlNet (control-aware unet.engine +
-// controlnet.engine): SD1.5 / SDXL, txt2img and img2img. ControlNet conditioning
-// is orthogonal to txt2img/img2img — only the starting latent differs (txt2img =
-// pure noise, img2img = VAE-encoded input frame). Both modes feed the Control/Style
-// inlet identically (set_controlnet_cond_rgba).
-static bool is_controlnet_workflow(int8_t wf) noexcept
-{
-  switch (wf)
-  {
-    case StreamDiffusion::Workflow::SD_TXT2IMG_CONTROLNET:
-    case StreamDiffusion::Workflow::SD_IMG2IMG_CONTROLNET:
-    case StreamDiffusion::Workflow::SDXL_TXT2IMG_CONTROLNET:
-    case StreamDiffusion::Workflow::SDXL_IMG2IMG_CONTROLNET:
-      return true;
-    default:
-      return false;
-  }
-}
-
 // Cross-attention width declared by a bundle's manifest, or 0 when there is no usable manifest.
-// The SD1.5 family is not one width: SD1.5 is 768, SD2.1 is 1024, and the workflow enum cannot tell
-// them apart. Exporter-written bundle.json carries it; the pre-manifest hash bundles do not, and
-// those fall back to the per-model-type default. Deliberately a scan and not a JSON parse -- one
-// integer out of a file we generate ourselves does not justify a dependency the SDK / JIT /
-// standalone builds would also have to carry.
+// SD1.5 encodes to 768, SD2.1 to 1024, and the workflow enum cannot tell them apart. A scan and
+// not a JSON parse: one integer out of a file we generate ourselves.
 static int bundle_embedding_dim(const std::string& model_dir)
 {
   std::ifstream f{model_dir + "/bundle.json", std::ios::binary};
   if(!f)
     return 0;
-  const std::string text{
-      std::istreambuf_iterator<char>{f}, std::istreambuf_iterator<char>{}};
+  const std::string text{std::istreambuf_iterator<char>{f}, std::istreambuf_iterator<char>{}};
 
   const auto key = text.find("\"embedding_dim\"");
   if(key == std::string::npos)
@@ -269,380 +225,132 @@ static int bundle_embedding_dim(const std::string& model_dir)
   while(p < text.size() && text[p] >= '0' && text[p] <= '9')
   {
     dim = dim * 10 + (text[p] - '0');
-    if(dim > 65536)   // nonsense manifest: ignore it rather than propagate a huge allocation
+    if(dim > 65536)
       return 0;
     ++p;
   }
   return p > begin ? dim : 0;
 }
 
-SDConfig::SDConfig()
+// Read 128 fp32 (a klein VAE batch-norm constant) from <path>.
+static bool read_bn_file(const std::string& path, std::array<float, 128>& out)
 {
-  const auto& sd = sd::liblibrediffusion::instance();
-  if (sd.available)
+  std::ifstream f(path, std::ios::binary);
+  if(!f)
+    return false;
+  f.read(reinterpret_cast<char*>(out.data()), 128 * sizeof(float));
+  return f.gcount() == static_cast<std::streamsize>(128 * sizeof(float));
+}
+
+// The RIFE engine for a bundle: its own, else one shared by the bundles of the parent folder.
+static std::string rife_engine_path(const std::string& model_dir)
+{
+  for(const std::string candidate :
+      {model_dir + "/rife_ifnet_fp16.plan", model_dir + "/../rife_ifnet_fp16.plan"})
+    if(file_exists(candidate))
+      return candidate;
+  return {};
+}
+
+static const char* build_state_name(BuildState s) noexcept
+{
+  switch(s)
   {
-    sd.config_create(&m_handle);
+    case BuildState::Idle:
+      return "idle";
+    case BuildState::Extracting:
+      return "extracting";
+    case BuildState::Running:
+      return "running";
+    case BuildState::Done:
+      return "done";
+    case BuildState::Failed:
+      return "failed";
+  }
+  return "";
+}
+
+// -------------------------------------------------------------------------------------------------
+// Workflow classification
+// -------------------------------------------------------------------------------------------------
+StreamDiffusion::Family StreamDiffusion::familyOf(Workflow wf) noexcept
+{
+  switch(wf)
+  {
+    case FLUX2_KLEIN_TXT2IMG:
+    case FLUX2_KLEIN_IMG2IMG:
+    case FLUX2_KLEIN_INPAINT:
+      return Family::Klein;
+    case IMG2IMG_TURBO:
+      return Family::Turbo;
+    default:
+      return Family::SD;
   }
 }
 
-SDConfig::~SDConfig()
+bool StreamDiffusion::isImg2Img(Workflow wf) noexcept
 {
-  if (m_handle)
+  switch(wf)
   {
-    const auto& sd = sd::liblibrediffusion::instance();
-    if (sd.available)
-    {
-      sd.config_destroy(m_handle);
-    }
+    case SD_IMG2IMG:
+    case SD_IMG2IMG_CONTROLNET:
+    case SD_IMG2IMG_IPADAPTER:
+    case SDTURBO_IMG2IMG:
+    case SDXL_IMG2IMG:
+    case SDXL_IMG2IMG_CONTROLNET:
+    case V2V_IMG2IMG:
+    case FLUX2_KLEIN_IMG2IMG:
+    case FLUX2_KLEIN_INPAINT:
+    case IMG2IMG_TURBO:
+      return true;
+    default:
+      return false;
   }
 }
 
-SDConfig::SDConfig(SDConfig&& other) noexcept
-    : m_handle{other.m_handle}
+// ControlNet conditioning is orthogonal to txt2img/img2img: only the starting latent differs.
+bool StreamDiffusion::isControlNet(Workflow wf) noexcept
 {
-  other.m_handle = nullptr;
-}
-
-SDConfig& SDConfig::operator=(SDConfig&& other) noexcept
-{
-  if (this != &other)
+  switch(wf)
   {
-    if (m_handle)
-    {
-      const auto& sd = sd::liblibrediffusion::instance();
-      if (sd.available)
-        sd.config_destroy(m_handle);
-    }
-    m_handle = other.m_handle;
-    other.m_handle = nullptr;
-  }
-  return *this;
-}
-
-librediffusion_config_handle SDConfig::release() noexcept
-{
-  auto h = m_handle;
-  m_handle = nullptr;
-  return h;
-}
-
-SDPipeline::SDPipeline(librediffusion_config_handle config)
-{
-  const auto& sd = sd::liblibrediffusion::instance();
-  if (sd.available && config)
-  {
-    sd.pipeline_create(config, &m_handle);
-    if (m_handle)
-    {
-      sd.pipeline_init_all(m_handle);
-    }
+    case SD_TXT2IMG_CONTROLNET:
+    case SD_IMG2IMG_CONTROLNET:
+    case SDXL_TXT2IMG_CONTROLNET:
+    case SDXL_IMG2IMG_CONTROLNET:
+      return true;
+    default:
+      return false;
   }
 }
 
-SDPipeline::~SDPipeline()
+bool StreamDiffusion::isIPAdapter(Workflow wf) noexcept
 {
-  reset();
+  return wf == SD_TXT2IMG_IPADAPTER || wf == SD_IMG2IMG_IPADAPTER;
 }
 
-SDPipeline::SDPipeline(SDPipeline&& other) noexcept
-    : m_handle{other.m_handle}
-{
-  other.m_handle = nullptr;
-}
-
-SDPipeline& SDPipeline::operator=(SDPipeline&& other) noexcept
-{
-  if (this != &other)
-  {
-    reset();
-    m_handle = other.m_handle;
-    other.m_handle = nullptr;
-  }
-  return *this;
-}
-
-void SDPipeline::reset()
-{
-  if (m_handle)
-  {
-    const auto& sd = sd::liblibrediffusion::instance();
-    if (sd.available)
-    {
-      sd.pipeline_destroy(m_handle);
-    }
-    m_handle = nullptr;
-  }
-}
-
-SDClip::SDClip(const char* engine_path, int device)
-{
-  const auto& sd = sd::liblibrediffusion::instance();
-  if (sd.available && engine_path)
-  {
-    sd.clip_create(engine_path, device, &m_handle);
-  }
-}
-
-SDClip::~SDClip()
-{
-  if (m_handle)
-  {
-    const auto& sd = sd::liblibrediffusion::instance();
-    if (sd.available)
-    {
-      sd.clip_destroy(m_handle);
-    }
-  }
-}
-
-SDClip::SDClip(SDClip&& other) noexcept
-    : m_handle{other.m_handle}
-{
-  other.m_handle = nullptr;
-}
-
-SDClip& SDClip::operator=(SDClip&& other) noexcept
-{
-  if (this != &other)
-  {
-    if (m_handle)
-    {
-      const auto& sd = sd::liblibrediffusion::instance();
-      if (sd.available)
-        sd.clip_destroy(m_handle);
-    }
-    m_handle = other.m_handle;
-    other.m_handle = nullptr;
-  }
-  return *this;
-}
-
-SDFluxStream::SDFluxStream(
-    const char* transformer, const char* qwen, const char* vae_decoder,
-    const char* vae_encoder, const char* tokenizer_json, int Th, int Tw,
-    unsigned long long seed)
-{
-  const auto& sd = sd::liblibrediffusion::instance();
-  if (sd.available && sd.flux2_stream_create)
-  {
-    m_handle = sd.flux2_stream_create(
-        transformer, qwen, vae_decoder, vae_encoder, tokenizer_json, Th, Tw, seed, 0);
-  }
-}
-
-SDFluxStream::~SDFluxStream()
-{
-  reset();
-}
-
-void SDFluxStream::reset()
-{
-  if (m_handle)
-  {
-    const auto& sd = sd::liblibrediffusion::instance();
-    if (sd.available && sd.flux2_stream_destroy)
-      sd.flux2_stream_destroy(m_handle);
-    m_handle = nullptr;
-  }
-}
-
-SDFluxStream::SDFluxStream(SDFluxStream&& other) noexcept
-    : m_handle{other.m_handle}
-{
-  other.m_handle = nullptr;
-}
-
-SDFluxStream& SDFluxStream::operator=(SDFluxStream&& other) noexcept
-{
-  if (this != &other)
-  {
-    reset();
-    m_handle = other.m_handle;
-    other.m_handle = nullptr;
-  }
-  return *this;
-}
-
-SDRife::SDRife(const char* engine_path)
-{
-  const auto& sd = sd::liblibrediffusion::instance();
-  if (sd.available && sd.rife_create && engine_path)
-  {
-    m_handle = sd.rife_create(engine_path, 0);
-  }
-}
-
-SDRife::~SDRife()
-{
-  reset();
-}
-
-void SDRife::reset()
-{
-  if (m_handle)
-  {
-    const auto& sd = sd::liblibrediffusion::instance();
-    if (sd.available && sd.rife_destroy)
-      sd.rife_destroy(m_handle);
-    m_handle = nullptr;
-  }
-}
-
-SDRife::SDRife(SDRife&& other) noexcept
-    : m_handle{other.m_handle}
-{
-  other.m_handle = nullptr;
-}
-
-SDRife& SDRife::operator=(SDRife&& other) noexcept
-{
-  if (this != &other)
-  {
-    reset();
-    m_handle = other.m_handle;
-    other.m_handle = nullptr;
-  }
-  return *this;
-}
-
-SDImg2ImgTurbo::SDImg2ImgTurbo(
-    const char* unet, const char* vae_encoder, const char* vae_decoder)
-{
-  const auto& sd = sd::liblibrediffusion::instance();
-  if (sd.available && sd.img2img_turbo_create)
-    m_handle = sd.img2img_turbo_create(unet, vae_encoder, vae_decoder, 0);
-}
-
-SDImg2ImgTurbo::~SDImg2ImgTurbo()
-{
-  reset();
-}
-
-void SDImg2ImgTurbo::reset()
-{
-  if (m_handle)
-  {
-    const auto& sd = sd::liblibrediffusion::instance();
-    if (sd.available && sd.img2img_turbo_destroy)
-      sd.img2img_turbo_destroy(m_handle);
-    m_handle = nullptr;
-  }
-}
-
-SDImg2ImgTurbo::SDImg2ImgTurbo(SDImg2ImgTurbo&& other) noexcept
-    : m_handle{other.m_handle}
-{
-  other.m_handle = nullptr;
-}
-
-SDImg2ImgTurbo& SDImg2ImgTurbo::operator=(SDImg2ImgTurbo&& other) noexcept
-{
-  if (this != &other)
-  {
-    reset();
-    m_handle = other.m_handle;
-    other.m_handle = nullptr;
-  }
-  return *this;
-}
-
-SDXLEmbeddings::~SDXLEmbeddings()
-{
-  reset();
-}
-
-SDXLEmbeddings::SDXLEmbeddings(SDXLEmbeddings&& other) noexcept
-    : embeddings{other.embeddings}
-    , pooled_embeds{other.pooled_embeds}
-    , time_ids{other.time_ids}
-{
-  other.embeddings = nullptr;
-  other.pooled_embeds = nullptr;
-  other.time_ids = nullptr;
-}
-
-SDXLEmbeddings& SDXLEmbeddings::operator=(SDXLEmbeddings&& other) noexcept
-{
-  if (this != &other)
-  {
-    reset();
-    embeddings = other.embeddings;
-    pooled_embeds = other.pooled_embeds;
-    time_ids = other.time_ids;
-    other.embeddings = nullptr;
-    other.pooled_embeds = nullptr;
-    other.time_ids = nullptr;
-  }
-  return *this;
-}
-
-void SDXLEmbeddings::reset()
-{
-  const auto& sd = sd::liblibrediffusion::instance();
-  if (sd.available)
-  {
-    if (embeddings)
-    {
-      sd.cuda_free(embeddings);
-      embeddings = nullptr;
-    }
-    if (pooled_embeds)
-    {
-      sd.cuda_free(pooled_embeds);
-      pooled_embeds = nullptr;
-    }
-    if (time_ids)
-    {
-      sd.cuda_free(time_ids);
-      time_ids = nullptr;
-    }
-  }
-}
-
+// -------------------------------------------------------------------------------------------------
+// Lifetime
+// -------------------------------------------------------------------------------------------------
 StreamDiffusion::StreamDiffusion() noexcept
-    : m_sd{sd::liblibrediffusion::instance()}
+    : m_sd{lib()}
 {
-  // halp::texture_output's constructor sets changed = true with bytes == nullptr, so a node that
-  // has never rendered would advertise a changed texture pointing at nothing.
+  // halp::texture_output's constructor sets changed = true with bytes == nullptr.
   outputs.image.texture.changed = false;
-
-  m_prev_inputs.workflow.value = {};
-  m_prev_inputs.add_noise.value = {};
-  m_prev_inputs.prompt.value = {};
-  m_prev_inputs.negative_prompt.value = {};
-  m_prev_inputs.model.value = {};
-  m_prev_inputs.seed.value = {};
-  m_prev_inputs.guidance.value = {};
-  m_prev_inputs.t1.value = {};
-  m_prev_inputs.size.value = {};
-  m_prev_inputs.cfg.value = {};
-  m_prev_inputs.add_noise.value = {};
-  m_prev_inputs.denoise_batch.value = {};
-  m_prev_inputs.controlnet_scale.value = {};
-  m_prev_inputs.ipadapter_scale.value = {};
 }
 
 StreamDiffusion::~StreamDiffusion()
 {
-  // Phase C: join the producer BEFORE anything it touches (m_klein_stream, RIFE) is destroyed, so no
-  // context/stream is used after free.
-  stopKleinProducer();
-  // Same for the generic SD/SDXL producer: its produce body touches m_cached_engine + m_sd_producer_rife
-  // + m_sd_prev_key, so join it before those (and the cached engine below) are destroyed.
-  stopSDProducer();
-  if (m_cached_engine)
-  {
+  // The producer touches every pipeline handle: join it before anything is destroyed.
+  releaseFamily();
+  if(m_cached_engine)
     EngineCache::instance().release(m_cached_engine);
-    m_cached_engine = nullptr;
-  }
 }
 
 bool StreamDiffusion::is_available() noexcept
 {
-  return sd::liblibrediffusion::instance().available;
+  return lib().available;
 }
 
-// The input set that decides whether the setup can succeed at all.
 StreamDiffusion::SetupKey StreamDiffusion::setupKey(const inputs_t& in)
 {
   SetupKey k;
@@ -652,6 +360,7 @@ StreamDiffusion::SetupKey StreamDiffusion::setupKey(const inputs_t& in)
   k.timesteps = in.t1.value;
   k.width = in.size.value.x;
   k.height = in.size.value.y;
+  k.gpu = in.gpu.value;
   k.workflow = in.workflow.value;
   k.cfg = in.cfg.value;
   k.klein_quality = in.klein_quality.value;
@@ -661,1632 +370,36 @@ StreamDiffusion::SetupKey StreamDiffusion::setupKey(const inputs_t& in)
   return k;
 }
 
-// `m_prev_inputs = inputs` is only reached on success, so without this a failing configuration
-// re-attempts a full engine load on every tick, at 60..1000 Hz. Remember the exact input set that
-// failed and skip until something that actually matters changes.
+// Without this a failing configuration re-attempts a full engine load on every tick.
 bool StreamDiffusion::setupBlocked(const inputs_t& in) const
 {
   return m_failed_setup.valid && m_failed_setup == setupKey(in);
 }
 
-void StreamDiffusion::noteSetupFailure(const inputs_t& in)
-{
-  m_failed_setup = setupKey(in);
-}
-
-// Validate + clamp the Resolution port before any of it reaches a buffer allocation or the
-// library. Returns false when the request cannot be honoured at all, in which case the caller must
-// skip the frame. Diagnoses once per distinct bad value, not once per tick.
-bool StreamDiffusion::resolveResolution(const inputs_t& in, int& w, int& h)
+// The latent grid is width/step by height/step (8 for SD, 16 for klein); round DOWN to the nearest
+// multiple, floor `step`. Diagnoses once per distinct bad value.
+bool StreamDiffusion::resolveResolution(const inputs_t& in, int step, int& w, int& h)
 {
   const int rw = in.size.value.x;
   const int rh = in.size.value.y;
   const bool usable = (rw > 0 && rh > 0);
 
-  // The latent grid is width/8 by height/8 and the library refuses a size that is not a whole
-  // number of latent cells. The port has step 1, so 100 / 513 / 777 are all one drag away; round
-  // DOWN to the nearest multiple of 8 (never up, so the clamp above stays a clamp), floor 8.
-  w = usable ? std::max(8, std::min(rw, k_max_resolution) & ~7) : rw;
-  h = usable ? std::max(8, std::min(rh, k_max_resolution) & ~7) : rh;
+  w = usable ? std::max(step, std::min(rw, k_max_resolution) / step * step) : rw;
+  h = usable ? std::max(step, std::min(rh, k_max_resolution) / step * step) : rh;
 
-  if((!usable || w != rw || h != rh)
-     && (rw != m_reported_size_w || rh != m_reported_size_h))
+  if((!usable || w != rw || h != rh) && (rw != m_reported_size_w || rh != m_reported_size_h))
   {
     m_reported_size_w = rw;
     m_reported_size_h = rh;
     std::fprintf(
-        stderr, "StreamDiffusion: Resolution %dx%d -- %s (usable range 8..%d, multiples of 8)\n",
-        rw, rh, usable ? "adjusted" : "frame skipped", k_max_resolution);
+        stderr, "StreamDiffusion: Resolution %dx%d -- %s (usable range %d..%d, multiples of %d)\n",
+        rw, rh, usable ? "adjusted" : "frame skipped", step, k_max_resolution, step);
   }
   return usable;
 }
 
-void StreamDiffusion::blendTextures()
-{
-  const auto model_sz = m_cur_input.size();
-
-  const int byte_count = model_sz.width() * model_sz.height() * 4;
-  if(inputs.feed_prev_in > 0 && inputs.feed_prev_out > 0
-     && m_prev_input.size() == model_sz && m_prev_output.size() == model_sz)
-  {
-    const uint8_t* prev_input = (const uint8_t*)m_prev_input.constBits();
-    const uint8_t* prev_output = (const uint8_t*)m_prev_output.constBits();
-    uint8_t* cur_input = m_cur_input.bits();
-    const int a = std::clamp(int(inputs.feed_prev_in * 256.f), 0, 256);
-    const int b = std::clamp(int(inputs.feed_prev_out * 256.f), 0, 256 - a);
-    const int c = 256 - a - b;
-
-    for(int i = 0; i < byte_count; i += 4)
-    {
-      cur_input[i + 0]
-          = (c * cur_input[i + 0] + a * prev_input[i + 0] + b * prev_output[i + 0] + 128)
-            >> 8;
-      cur_input[i + 1]
-          = (c * cur_input[i + 1] + a * prev_input[i + 1] + b * prev_output[i + 1] + 128)
-            >> 8;
-      cur_input[i + 2]
-          = (c * cur_input[i + 2] + a * prev_input[i + 2] + b * prev_output[i + 2] + 128)
-            >> 8;
-    }
-  }
-  else if(inputs.feed_prev_in > 0)
-  {
-    // Blend previous input
-    if(m_prev_input.size() == model_sz)
-    {
-      const uint8_t* prev_input = (const uint8_t*)m_prev_input.constBits();
-      uint8_t* cur_input = m_cur_input.bits();
-      const int a = std::clamp(int(inputs.feed_prev_in * 256.f), 0, 256);
-      const int c = 256 - a;
-
-      for(int i = 0; i < byte_count; i += 4)
-      {
-        cur_input[i + 0] = (c * cur_input[i + 0] + a * prev_input[i + 0] + 128) >> 8;
-        cur_input[i + 1] = (c * cur_input[i + 1] + a * prev_input[i + 1] + 128) >> 8;
-        cur_input[i + 2] = (c * cur_input[i + 2] + a * prev_input[i + 2] + 128) >> 8;
-      }
-    }
-  }
-  else if(inputs.feed_prev_out > 0)
-  {
-    // Blend previous input
-    if(m_prev_output.size() == model_sz)
-    {
-      const uint8_t* prev_output = (const uint8_t*)m_prev_output.constBits();
-      uint8_t* cur_input = m_cur_input.bits();
-      const int a = std::clamp(int(inputs.feed_prev_out * 256.f), 0, 256);
-      const int c = 256 - a;
-
-      for(int i = 0; i < byte_count; i += 4)
-      {
-        cur_input[i + 0] = (c * cur_input[i + 0] + a * prev_output[i + 0] + 128) >> 8;
-        cur_input[i + 1] = (c * cur_input[i + 1] + a * prev_output[i + 1] + 128) >> 8;
-        cur_input[i + 2] = (c * cur_input[i + 2] + a * prev_output[i + 2] + 128) >> 8;
-      }
-    }
-  }
-}
-
-bool StreamDiffusion::createConfiguration(const inputs_t& in_config, const std::vector<int>& timestep_indices)
-{
-  if (!m_sd.available)
-    return false;
-
-  int width = 0, height = 0;
-  if (!resolveResolution(in_config, width, height))
-    return false;
-
-  if (timestep_indices.empty())
-    return false;
-
-  // Determine model type and mode from workflow
-  librediffusion_model_type_t model_type = MODEL_SD_15;
-  librediffusion_pipeline_mode_t pipeline_mode = MODE_SINGLE_FRAME;
-
-  switch (in_config.workflow)
-  {
-    case Workflow::SD_TXT2IMG:
-    case Workflow::SD_IMG2IMG:
-    case Workflow::SD_TXT2IMG_CONTROLNET:
-    case Workflow::SD_IMG2IMG_CONTROLNET:
-    case Workflow::SD_TXT2IMG_IPADAPTER:
-    case Workflow::SD_IMG2IMG_IPADAPTER:
-      model_type = MODEL_SD_15;
-      pipeline_mode = MODE_SINGLE_FRAME;
-      break;
-    case Workflow::SDTURBO_TXT2IMG:
-    case Workflow::SDTURBO_IMG2IMG:
-      model_type = MODEL_SD_TURBO;
-      pipeline_mode = MODE_SINGLE_FRAME;
-      break;
-    case Workflow::SDXL_TXT2IMG:
-    case Workflow::SDXL_IMG2IMG:
-    case Workflow::SDXL_TXT2IMG_CONTROLNET:
-    case Workflow::SDXL_IMG2IMG_CONTROLNET:
-      model_type = MODEL_SDXL_TURBO;
-      pipeline_mode = MODE_SINGLE_FRAME;
-      break;
-    case Workflow::V2V_TXT2IMG:
-    case Workflow::V2V_IMG2IMG:
-      model_type = MODEL_SD_15;
-      pipeline_mode = MODE_TEMPORAL_V2V;
-      break;
-    case Workflow::FLUX2_KLEIN_TXT2IMG:
-    case Workflow::FLUX2_KLEIN_IMG2IMG:
-    case Workflow::FLUX2_KLEIN_INPAINT:
-      // Handled by the dedicated klein streaming path (runKlein); never reached here.
-      return false;
-  }
-
-  // Check if we already have a cached engine
-  bool need_new_engine = false;
-  if (!m_cached_engine)
-  {
-    need_new_engine = true;
-  }
-  else if (m_cached_engine->model_path != in_config.model.value
-           || m_cached_engine->pipeline_mode != pipeline_mode)
-  {
-    // Need different engine
-    EngineCache::instance().release(m_cached_engine);
-    m_cached_engine = nullptr;
-    need_new_engine = true;
-  }
-  // else keep existing engine
-
-  if (need_new_engine)
-  {
-    // Try to acquire from cache (key = model path + pipeline mode + device).
-    // m_config_state is not repopulated until further down, so anything that starts driving
-    // .device from a port must set it BEFORE this lookup or the entry is matched on the previous
-    // device.
-    m_cached_engine = EngineCache::instance().acquire(
-        in_config.model.value, pipeline_mode, m_config_state.device);
-
-    if (!m_cached_engine)
-    {
-      auto new_engine = std::make_unique<CachedEngine>();
-      new_engine->model_path = in_config.model.value;
-      new_engine->pipeline_mode = pipeline_mode;
-      new_engine->device = m_config_state.device;
-
-      // Create CLIP encoders
-      std::string clip1_path = in_config.model.value + "/clip.engine";
-      new_engine->clip1 = new SDClip{clip1_path.c_str(), m_config_state.device};
-      if (!*new_engine->clip1)
-        return false;
-
-      if(model_type == MODEL_SDXL_TURBO)
-      {
-        std::string clip2_path = in_config.model.value + "/clip2.engine";
-        new_engine->clip2 = new SDClip{clip2_path.c_str(), m_config_state.device};
-        if (!*new_engine->clip2)
-          return false;
-      }
-
-      // Store in cache
-      m_cached_engine = EngineCache::instance().store(std::move(new_engine));
-      // FIXME evict engines if unused
-    }
-  }
-  else
-  {
-    std::fprintf(stderr, "StreamDiffusion: keeping existing engine, will reinit buffers\n");
-  }
-
-  // The EngineCache key is (model path, pipeline mode) and SD / SDXL / ControlNet / IP-Adapter all
-  // share MODE_SINGLE_FRAME, so an entry created by an SD workflow reaches here without the clip2
-  // an SDXL workflow needs. Build it on demand; the expensive UNet/VAE engines are still reused.
-  if (model_type == MODEL_SDXL_TURBO && m_cached_engine && !m_cached_engine->clip2)
-  {
-    std::string clip2_path = in_config.model.value + "/clip2.engine";
-    auto* clip2 = new SDClip{clip2_path.c_str(), m_config_state.device};
-    if (!*clip2)
-    {
-      std::fprintf(stderr, "StreamDiffusion: SDXL workflow but %s could not be loaded\n",
-                   clip2_path.c_str());
-      delete clip2;
-      return false;
-    }
-    m_cached_engine->clip2 = clip2;
-  }
-
-  // Store configuration state (this is per-instance, not cached)
-  m_config_state.model_type = model_type;
-  m_config_state.pipeline_mode = pipeline_mode;
-  m_config_state.width = width;
-  m_config_state.height = height;
-  m_config_state.latent_width = width / 8;
-  m_config_state.latent_height = height / 8;
-  m_config_state.batch_size = 1;
-  m_config_state.timestep_indices = std::move(timestep_indices);
-  m_config_state.denoising_steps = m_config_state.timestep_indices.size();
-
-  m_config_state.unet_engine_path = in_config.model.value + "/unet.engine";
-  m_config_state.vae_encoder_path = in_config.model.value + "/vae_encoder.engine";
-  m_config_state.vae_decoder_path = in_config.model.value + "/vae_decoder.engine";
-
-  // ControlNet / IP-Adapter feature flags from the workflow. ControlNet needs a
-  // control-aware unet.engine + a separate controlnet.engine in the model folder.
-  // IP-Adapter needs an IP-variant unet.engine (auto-detected at init); the IP
-  // attention is baked into the unet.engine, so no separate engine path.
-  m_config_state.controlnet_index = -1;
-  m_config_state.controlnet_scale = in_config.controlnet_scale;
-  m_config_state.ipadapter_enabled = false;
-  m_config_state.ipadapter_scale = in_config.ipadapter_scale;
-  m_config_state.ipadapter_num_tokens = 4;  // SD1.5 base IP-Adapter (16 = plus)
-  switch (in_config.workflow)
-  {
-    case Workflow::SD_TXT2IMG_CONTROLNET:
-    case Workflow::SD_IMG2IMG_CONTROLNET:
-    case Workflow::SDXL_TXT2IMG_CONTROLNET:
-    case Workflow::SDXL_IMG2IMG_CONTROLNET:
-      // controlnet_index assigned below once the config handle exists.
-      break;
-    case Workflow::SD_TXT2IMG_IPADAPTER:
-    case Workflow::SD_IMG2IMG_IPADAPTER:
-      m_config_state.ipadapter_enabled = true;
-      break;
-    default:
-      break;
-  }
-
-  // Model-specific settings
-  if(model_type == MODEL_SD_TURBO)
-  {
-    m_config_state.use_denoising_batch = false;
-    m_config_state.do_add_noise = in_config.add_noise;
-    m_config_state.denoising_steps = 1;
-    m_config_state.cfg_type = 0;
-    m_config_state.delta = in_config.delta;
-    m_config_state.guidance_scale = 0.0f;
-    m_config_state.text_seq_len = 77;
-    m_config_state.text_hidden_dim = 1024;
-    m_config_state.clip_pad_token = 0;
-  }
-  else if(model_type == MODEL_SDXL_TURBO)
-  {
-    // Inert at one step; the multi-step SDXL bundles below need it, since the batched form is the
-    // one their goldens were produced with (every multi-step img2img golden cell is `batch-1`).
-    m_config_state.use_denoising_batch = in_config.denoise_batch;
-    m_config_state.do_add_noise = in_config.add_noise;
-    // MODEL_SDXL_TURBO is the whole SDXL family here, not just sdxl-turbo: Hyper-SDXL /
-    // SDXL-Lightning / LCM-LoRA-SDXL / Segmind-VegaRT are multi-step, so keep the step count the
-    // Timesteps port asked for. The engine's batch profile is what actually constrains it (a static
-    // b1-1 bundle rejects >1 at init).
-    m_config_state.cfg_type = 0;
-    m_config_state.delta = in_config.delta;
-    m_config_state.guidance_scale = 0.0f;
-    m_config_state.text_seq_len = 77;
-    m_config_state.text_hidden_dim = 2048;
-    m_config_state.pooled_embedding_dim = 1280;
-    m_config_state.clip_pad_token = 0;
-  }
-  else // MODEL_SD_15
-  {
-    m_config_state.use_denoising_batch = in_config.denoise_batch;
-    m_config_state.do_add_noise = in_config.add_noise;
-    switch (in_config.cfg)
-    {
-      case None:
-        m_config_state.cfg_type = SD_CFG_NONE;
-        break;
-      case Full:
-        m_config_state.cfg_type = SD_CFG_FULL;
-        break;
-      case Self:
-        m_config_state.cfg_type = SD_CFG_SELF;
-        break;
-      case Initialize:
-        m_config_state.cfg_type = SD_CFG_INITIALIZE;
-        break;
-    }
-    m_config_state.delta = in_config.delta;
-    m_config_state.guidance_scale = in_config.guidance;
-    m_config_state.text_seq_len = 77;
-    m_config_state.text_hidden_dim = 768;
-    m_config_state.clip_pad_token = 49407;
-    // SD2.1 shares this path but encodes to 1024. Take the manifest's width when it declares one.
-    if(const int dim = bundle_embedding_dim(in_config.model.value); dim > 0)
-      m_config_state.text_hidden_dim = dim;
-  }
-
-  // Create config handle for pipeline
-  SDConfig config;
-  if (!config)
-    return false;
-
-  // The setters that VALIDATE reject a request instead of storing it, and the config then keeps its
-  // defaults (512x512 / 64x64 latents) while everything downstream reports success -- so the
-  // pipeline would be built and driven at a geometry nobody asked for. Refuse the configuration.
-  auto accepted = [](librediffusion_error_t err, const char* what) {
-    if (err == LIBREDIFFUSION_SUCCESS)
-      return true;
-    std::fprintf(stderr, "StreamDiffusion: %s rejected the request (%d)\n", what, (int)err);
-    return false;
-  };
-
-  // Apply settings via C API
-  m_sd.config_set_device(config.get(), m_config_state.device);
-  m_sd.config_set_model_type(config.get(), model_type);
-  m_sd.config_set_pipeline_mode(config.get(), pipeline_mode);
-  if (!accepted(
-          m_sd.config_set_dimensions(
-              config.get(), width, height, m_config_state.latent_width,
-              m_config_state.latent_height),
-          "config_set_dimensions"))
-    return false;
-  if (!accepted(
-          m_sd.config_set_batch_size(config.get(), m_config_state.batch_size),
-          "config_set_batch_size"))
-    return false;
-  if (!accepted(
-          m_sd.config_set_denoising_steps(config.get(), m_config_state.denoising_steps),
-          "config_set_denoising_steps"))
-    return false;
-  m_sd.config_set_guidance_scale(config.get(), m_config_state.guidance_scale);
-  m_sd.config_set_delta(config.get(), m_config_state.delta);
-  m_sd.config_set_add_noise(config.get(), m_config_state.do_add_noise ? 1 : 0);
-  m_sd.config_set_denoising_batch(config.get(), m_config_state.use_denoising_batch ? 1 : 0);
-  m_sd.config_set_cfg_type(
-      config.get(), static_cast<librediffusion_cfg_type_t>(m_config_state.cfg_type));
-
-  // CUDA graph: enable for 1-step workflows (SD-Turbo / SDXS / 1-step Hyper + their ControlNet/IP-Adapter
-  // variants). Capturable only for denoising_steps==1, cfg-none, non-V2V (the .so re-gates identically and
-  // falls back to per-call enqueue otherwise). Measured ~+16% end-to-end, output bit-identical. See
-  // CUDA_GRAPH_INTEGRATION_PLAN.md.
-  {
-    const bool one_step_graphable
-        = m_config_state.denoising_steps == 1
-          && m_config_state.cfg_type == SD_CFG_NONE
-          && pipeline_mode != MODE_TEMPORAL_V2V;
-    m_sd.config_set_cuda_graph(config.get(), one_step_graphable ? 1 : 0);
-  }
-
-  if (!accepted(
-          m_sd.config_set_text_config(
-              config.get(), m_config_state.text_seq_len, m_config_state.text_hidden_dim,
-              m_config_state.clip_pad_token),
-          "config_set_text_config"))
-    return false;
-
-  if(model_type == MODEL_SDXL_TURBO)
-  {
-    if (!accepted(
-            m_sd.config_set_sdxl_config(config.get(), m_config_state.pooled_embedding_dim, 6),
-            "config_set_sdxl_config"))
-      return false;
-  }
-
-  m_sd.config_set_unet_engine(config.get(), m_config_state.unet_engine_path.c_str());
-  m_sd.config_set_vae_encoder(config.get(), m_config_state.vae_encoder_path.c_str());
-  m_sd.config_set_vae_decoder(config.get(), m_config_state.vae_decoder_path.c_str());
-
-  // ControlNet: register the controlnet engine + conditioning scale. Requires the
-  // control-aware unet.engine set above. Returns the net's index (>=0) used later
-  // by set_controlnet_cond[_rgba]/set_controlnet_scale.
-  if(is_controlnet_workflow(in_config.workflow.value))
-  {
-    if(!m_sd.config_add_controlnet)
-    {
-      std::fprintf(stderr, "StreamDiffusion: ControlNet requested but the librediffusion .so "
-                  "does not export config_add_controlnet\n");
-      return false;
-    }
-    std::string controlnet_engine = in_config.model.value + "/controlnet.engine";
-    m_config_state.controlnet_index = m_sd.config_add_controlnet(
-        config.get(), controlnet_engine.c_str(), m_config_state.controlnet_scale);
-    if(m_config_state.controlnet_index < 0)
-    {
-      std::fprintf(stderr, "StreamDiffusion: config_add_controlnet failed (missing %s?)\n",
-               controlnet_engine.c_str());
-      return false;
-    }
-  }
-
-  // IP-Adapter: configure the baked-in defaults (token count + uniform scale). The
-  // IP-variant unet.engine is auto-detected at init; image tokens are fed per-frame.
-  if(m_config_state.ipadapter_enabled)
-  {
-    if(!m_sd.config_set_ipadapter)
-    {
-      std::fprintf(stderr, "StreamDiffusion: IP-Adapter requested but the librediffusion .so "
-                  "does not export config_set_ipadapter\n");
-      return false;
-    }
-    m_sd.config_set_ipadapter(
-        config.get(), m_config_state.ipadapter_num_tokens, m_config_state.ipadapter_scale);
-
-    // On-device CLIP image encoder + projection: lets the node turn the raw "Control / Style"
-    // texture into IP-Adapter tokens (no host-side Python). Loaded only when both engines exist
-    // next to the model; otherwise the pipeline falls back to externally-fed tokens.
-    if(m_sd.config_set_ipadapter_image_encoder)
-    {
-      std::string enc = in_config.model.value + "/clip_image_encoder.engine";
-      std::string proj = in_config.model.value + "/ip_image_proj.engine";
-      m_sd.config_set_ipadapter_image_encoder(config.get(), enc.c_str(), proj.c_str());
-    }
-  }
-
-  m_sd.config_set_timestep_indices(
-      config.get(), m_config_state.timestep_indices.data(),
-      m_config_state.timestep_indices.size());
-
-  // Temporal coherence settings for V2V mode. The live C++ StreamV2V is the kvo_cache extended
-  // self-attention path (forward_v2v): each frame's K/V is banked and concatenated into the next
-  // frame's self-attention. cache_maxframes = how many previous frames the bank holds (engine
-  // profile supports up to 4); 2 is the validated default (matches the Python kvo golden, ~50 dB).
-  // use_feature_injection / injection_strength / similarity_threshold are INERT for the extended-attn
-  // engine (feature-injection + ToMe are not bakeable into the static TRT graph — a future phase);
-  // they are passed for forward-compat with a future injection-capable engine.
-  if(pipeline_mode == MODE_TEMPORAL_V2V)
-  {
-    m_sd.config_set_temporal_params(
-        config.get(),
-        1,                            // use_cached_attn (extended self-attention banking)
-        in_config.add_noise ? 1 : 0,  // use_feature_injection (inert for extended-attn engines)
-        0.8f,                         // injection_strength (inert)
-        0.78f,                        // similarity_threshold (inert)
-        1,                            // cache_interval (bank every frame)
-        2);                           // cache_maxframes (bank the previous 2 frames; profile max 4)
-  }
-
-  // ControlNet / IP-Adapter engines (controlnet.engine + the control-aware or
-  // IP-variant unet.engine) are loaded only at pipeline creation (init_engines),
-  // NOT at reinit_buffers. A cached pipeline built for another workflow would not
-  // have them (or would still have them when switching away). So when the workflow
-  // involves ControlNet or IP-Adapter — or the previous one did — force a fresh
-  // pipeline instead of a buffer reinit.
-  auto is_feature_workflow = [](int8_t wf) {
-    return is_controlnet_workflow(wf)
-           || wf == Workflow::SD_TXT2IMG_IPADAPTER
-           || wf == Workflow::SD_IMG2IMG_IPADAPTER;
-  };
-  const bool feature_pipeline
-      = is_feature_workflow(in_config.workflow.value)
-        || is_feature_workflow(m_prev_inputs.workflow.value);
-  if (feature_pipeline && m_cached_engine->pipeline)
-  {
-    delete m_cached_engine->pipeline;
-    m_cached_engine->pipeline = nullptr;
-  }
-
-  // Create or reinit pipeline
-  if (m_cached_engine->pipeline && *m_cached_engine->pipeline)
-  {
-    // Reinit buffers with the new config. This can be REFUSED -- the engines cannot be reloaded
-    // here, so a geometry outside their optimization profiles installs nothing and returns -7. The
-    // pipeline then keeps its old size while the node would allocate an output texture at the new
-    // one, and the .so's live rgba_resize would quietly hand back a rescaled render of the old
-    // geometry with nothing to show for it.
-    if (!accepted(
-            m_sd.pipeline_reinit_buffers(m_cached_engine->pipeline->get(), config.get()),
-            "pipeline_reinit_buffers"))
-      return false;
-  }
-  else
-  {
-    // Reload whole pipeline
-    delete m_cached_engine->pipeline;
-    m_cached_engine->pipeline = new SDPipeline{config.get()};
-
-    if (!*m_cached_engine->pipeline)
-      return false;
-  }
-
-  m_prev_inputs = inputs;
-  return true;
-}
-
-bool StreamDiffusion::updatePromptEmbedding(const std::string& prompt, SDXLEmbeddings& embeddings)
-{
-  if (!m_sd.available || !m_cached_engine || !m_cached_engine->pipeline || !m_cached_engine->clip1)
-    return false;
-
-  // The CLIP calls below OVERWRITE the device pointers with a fresh allocation, so anything already
-  // held here has to be released first or it leaks. The previous embedding has already been copied
-  // into the pipeline by prepare_(negative_)embeds, so nothing downstream still reads it.
-  embeddings.reset();
-
-  if(m_config_state.model_type == MODEL_SDXL_TURBO)
-  {
-    if (!m_cached_engine->clip2)
-      return false;
-
-    // Compute SDXL embeddings
-    librediffusion_error_t err = m_sd.clip_compute_embeddings_sdxl(
-        m_cached_engine->clip1->get(), m_cached_engine->clip2->get(), prompt.c_str(),
-        m_config_state.batch_size, m_config_state.height, m_config_state.width,
-        nullptr, // default stream
-        &embeddings.embeddings, &embeddings.pooled_embeds, &embeddings.time_ids);
-
-    if(err != LIBREDIFFUSION_SUCCESS)
-      return false;
-
-    // Prepare SDXL conditioning
-    if (m_sd.prepare_sdxl_conditioning(
-            m_cached_engine->pipeline->get(), embeddings.pooled_embeds, embeddings.time_ids)
-        != LIBREDIFFUSION_SUCCESS)
-      return false;
-  }
-  else
-  {
-    // Compute standard CLIP embeddings
-    librediffusion_error_t err = m_sd.clip_compute_embeddings(
-        m_cached_engine->clip1->get(), prompt.c_str(), m_config_state.clip_pad_token,
-        nullptr, // default stream
-        &embeddings.embeddings);
-
-    if(err != LIBREDIFFUSION_SUCCESS)
-      return false;
-  }
-  return true;
-}
-
-bool StreamDiffusion::updatePromptEmbeddings(const std::string& prompt, std::vector<SDXLEmbeddings>& embeddings)
-{
-  if (!m_sd.available || !m_cached_engine || !m_cached_engine->pipeline || !m_cached_engine->clip1)
-    return false;
-
-  // Reset existing embeddings
-  embeddings.clear();
-
-  // Split if necessary:
-  if (auto weights = parse_input_string(prompt))
-  {
-    boost::container::small_vector<float, 8> bweight;
-    boost::container::small_vector<librediffusion_half_t*, 8> bembeds;
-    for (const auto& [k, v] : *weights)
-    {
-      SDXLEmbeddings e;
-      // blend_embeds does not null-check its elements, and a null device pointer there is an
-      // illegal access that kills the CUDA context for the whole process.
-      if (!updatePromptEmbedding(k, e) || !e.embeddings)
-      {
-        embeddings.clear();
-        return false;
-      }
-      bembeds.push_back(e.embeddings);
-      embeddings.push_back(std::move(e));
-      bweight.push_back(v);
-    }
-
-    if (bembeds.empty())
-      return false;
-
-    if (m_sd.blend_embeds(m_cached_engine->pipeline->get(), bembeds.data(), bweight.data(), bembeds.size(), m_config_state.text_seq_len, m_config_state.text_hidden_dim)
-        != LIBREDIFFUSION_SUCCESS)
-      return false;
-  }
-  else
-  {
-    SDXLEmbeddings e;
-    if (!updatePromptEmbedding(prompt, e) || !e.embeddings)
-    {
-      embeddings.clear();
-      return false;
-    }
-    embeddings.push_back(std::move(e));
-
-    if (m_sd.prepare_embeds(m_cached_engine->pipeline->get(), embeddings.front().embeddings,
-                            m_config_state.text_seq_len, m_config_state.text_hidden_dim)
-        != LIBREDIFFUSION_SUCCESS)
-      return false;
-  }
-  return true;
-}
-
-bool StreamDiffusion::updateScheduler(const std::string& timestep_str)
-{
-  if (!m_sd.available || !m_cached_engine || !m_cached_engine->pipeline)
-    return false;
-
-  auto timestep_indices = get_steps(timestep_str);
-  if (!timestep_indices || timestep_indices->empty())
-    return false;
-
-  // sd-turbo is genuinely single-step; SDXL is not (see createConfiguration).
-  if(m_config_state.model_type == MODEL_SD_TURBO)
-  {
-    timestep_indices->resize(1);
-  }
-
-  m_config_state.timestep_indices = std::move(*timestep_indices);
-  m_config_state.denoising_steps = m_config_state.timestep_indices.size();
-
-  // Build scheduler arrays from precomputed tables
-  static thread_local std::vector<float> timesteps;
-  timesteps.clear();
-  static thread_local std::vector<float> alpha_list;
-  alpha_list.clear();
-  static thread_local std::vector<float> beta_list;
-  beta_list.clear();
-  static thread_local std::vector<float> c_skip_list;
-  c_skip_list.clear();
-  static thread_local std::vector<float> c_out_list;
-  c_out_list.clear();
-
-  std::span<const int> scheduler_timesteps;
-  std::span<const streamdiffusion::TimestepParams> scheduler_params;
-  // Get the appropriate scheduler parameters
-  {
-
-    using namespace streamdiffusion;
-    switch(m_config_state.model_type)
-    {
-      case MODEL_SD_15:
-        scheduler_timesteps = SCHEDULER_SIMIANLUO_LCM_DREAMSHAPER_V7::TIMESTEP_VALUES;
-        scheduler_params = SCHEDULER_SIMIANLUO_LCM_DREAMSHAPER_V7::TIMESTEP_PARAMS;
-        break;
-      case MODEL_SD_TURBO:
-        scheduler_timesteps = SCHEDULER_STABILITYAI_SD_TURBO::TIMESTEP_VALUES;
-        scheduler_params = SCHEDULER_STABILITYAI_SD_TURBO::TIMESTEP_PARAMS;
-        break;
-      case MODEL_SDXL_TURBO:
-        scheduler_timesteps = SCHEDULER_STABILITYAI_SDXL_TURBO::TIMESTEP_VALUES;
-        scheduler_params = SCHEDULER_STABILITYAI_SDXL_TURBO::TIMESTEP_PARAMS;
-        break;
-      case MODEL_FLUX2_KLEIN_4B:
-        // klein uses its own flow-match scheduler computed inside the flux2 stream
-        // C-API; this SD scheduler table path is never used for klein.
-        return false;
-    }
-
-    for(int idx : m_config_state.timestep_indices)
-    {
-      if(idx < 0 || idx >= std::ssize(scheduler_params))
-        continue;
-      if(idx < 0 || idx >= std::ssize(scheduler_timesteps))
-        continue;
-      auto params = scheduler_params[idx];
-      int t = scheduler_timesteps[idx];
-
-      timesteps.push_back(static_cast<float>(t));
-      alpha_list.push_back(params.alpha_prod_t_sqrt);
-      beta_list.push_back(params.beta_prod_t_sqrt);
-      c_skip_list.push_back(params.c_skip);
-      c_out_list.push_back(params.c_out);
-    }
-  }
-
-  if (timesteps.empty())
-    return false;
-
-  const auto err = m_sd.prepare_scheduler(m_cached_engine->pipeline->get(),
-                          timesteps.data(),
-                          alpha_list.data(),
-                          beta_list.data(),
-                          c_skip_list.data(),
-                          c_out_list.data(),
-                          timesteps.size());
-  if (err != LIBREDIFFUSION_SUCCESS)
-  {
-    std::fprintf(stderr, "StreamDiffusion: prepare_scheduler failed (%d)\n", (int)err);
-    return false;
-  }
-
-  return true;
-}
-
-namespace
-{
-// Default location of the klein VAE batch-norm constants when the model folder
-// does not ship them. These are model constants (per-channel batchnorm over the
-// 128 patchified latent channels), 128 fp32 each.
-static constexpr const char* k_klein_bn_fallback_dir
-    = "/home/jcelerier/ossia/daydream-streamdiffusion/validation/klein_bn";
-
-// Read 128 fp32 from <path>. Returns false if the file is missing/short.
-bool read_bn_file(const std::string& path, std::array<float, 128>& out)
-{
-  std::ifstream f(path, std::ios::binary);
-  if (!f)
-    return false;
-  f.read(reinterpret_cast<char*>(out.data()), 128 * sizeof(float));
-  return f.gcount() == static_cast<std::streamsize>(128 * sizeof(float));
-}
-
-// Load the klein bn constants: prefer the model folder, fall back to the
-// validation dir.
-bool load_klein_bn(
-    const std::string& model_dir, std::array<float, 128>& mean,
-    std::array<float, 128>& sstd)
-{
-  if (read_bn_file(model_dir + "/bn_mean.bin", mean)
-      && read_bn_file(model_dir + "/bn_std.bin", sstd))
-    return true;
-  if (read_bn_file(std::string(k_klein_bn_fallback_dir) + "/bn_mean.bin", mean)
-      && read_bn_file(std::string(k_klein_bn_fallback_dir) + "/bn_std.bin", sstd))
-    return true;
-  return false;
-}
-}
-
-unsigned long long StreamDiffusion::kleinSeed(const inputs_t& in_config) noexcept
-{
-  // Fixed seed for temporal coherence (FluxRT convention).
-  const auto seed
-      = static_cast<unsigned long long>(static_cast<uint32_t>(in_config.seed.value));
-  return seed == 0 ? 52ull : seed;
-}
-
-bool StreamDiffusion::createKleinStream(const inputs_t& in_config)
-{
-  if (!m_sd.available || !m_sd.flux2_stream_create)
-    return false;
-
-  const std::string& model = in_config.model.value;
-
-  // Resolution -> packed token grid. H = Th*16, W = Tw*16.
-  // Round to multiples of 16 (the klein patch+VAE stride).
-  int w = 0, h = 0;
-  if (!resolveResolution(in_config, w, h))
-    return false;
-  w = std::max(16, (w / 16) * 16);
-  h = std::max(16, (h / 16) * 16);
-  const int Tw = w / 16;
-  const int Th = h / 16;
-
-  // Transformer engine: bf16 (Quality) vs fp8_calib (Speed).
-  const int quality = static_cast<int>(in_config.klein_quality.value);
-  const std::string transformer
-      = model
-        + (quality == StreamDiffusion::Speed ? "/transformer_fp8_calib.plan"
-                                             : "/transformer_bf16.plan");
-  const std::string qwen = model + "/qwen3_encoder_bf16.plan";
-  const std::string vae_dec = model + "/vae_decoder_bf16.plan";
-  const std::string vae_enc = model + "/vae_encoder_bf16.plan";
-  const std::string tok = model + "/tokenizer.json";
-
-  const unsigned long long seed = kleinSeed(in_config);
-
-  // Phase C: the producer thread holds m_klein_stream's handle. Drain+join it BEFORE destroying the
-  // old stream (assigning a new SDFluxStream frees the old handle) -> no use-after-free on reconfig.
-  stopKleinProducer();
-
-  m_klein_stream = SDFluxStream{
-      transformer.c_str(), qwen.c_str(), vae_dec.c_str(), vae_enc.c_str(),
-      tok.c_str(), Th, Tw, seed};
-  if (!m_klein_stream)
-  {
-    std::fprintf(stderr, "FLUX.2-klein: failed to create stream pipeline\n");
-    return false;
-  }
-
-  // 2 fixed steps for distilled klein.
-  if (m_sd.flux2_stream_set_steps)
-    m_sd.flux2_stream_set_steps(m_klein_stream.get(), 2);
-
-  // VAE batch-norm constants (required before frame()).
-  std::array<float, 128> bn_mean{}, bn_std{};
-  if (!load_klein_bn(model, bn_mean, bn_std))
-  {
-    std::fprintf(stderr, "FLUX.2-klein: missing bn_mean.bin/bn_std.bin (model folder or fallback)\n");
-    return false;
-  }
-  if (m_sd.flux2_stream_set_bn)
-    m_sd.flux2_stream_set_bn(m_klein_stream.get(), bn_mean.data(), bn_std.data());
-
-  m_klein_model_path = model;
-  m_klein_quality = quality;
-  m_klein_seed = seed;
-  m_klein_w = w;
-  m_klein_h = h;
-  m_klein_prompt.clear();
-  m_klein_sched.clear();   // force re-apply of the Timesteps->schedule on the next runKlein tick
-  m_klein_mask_hash = 0;   // force re-apply of the inpaint mask on the next runKlein tick
-  m_klein_have_prev = false;
-  m_klein_prev_out.assign((size_t)w * h * 4, 0);
-  // reset the cached reference + the RIFE display queue on (re)create
-  m_klein_ref_set = false;
-  m_klein_ref_hash = 0;
-  m_klein_queue.clear();
-  // async (Phase C): bump generation (stale keyframes from the old gen are dropped) + reset the paced
-  // consumer (FIFO / measured rate / phase) and the producer-side prev-key. The producer is stopped
-  // above (stopKleinProducer also resets these) and (re)started lazily by runKleinAsync.
-  ++m_klein_gen;
-  m_klein_consumer.reset();
-  m_klein_have_prev_key = false;     // producer-thread: forget the prev keyframe
-  m_klein_last_tick_t = 0.0;
-  m_klein_async_ref_set = false;
-  m_klein_async_ref_hash = 0;
-  // remember the RIFE engine path so the producer can lazily create its OWN RIFE handle (the producer
-  // thread runs RIFE next to diffusion; the render thread does no GPU compute).
-  {
-    std::string rp = in_config.model.value + "/rife_ifnet_fp16.plan";
-    if (!file_exists(rp))
-      rp = "/media/data2/flux-trt/engine-rife/rife_ifnet_fp16.plan";
-    m_klein_rife_path = rp;
-  }
-  return true;
-}
-
-// ---- Shared render-side async driver (used by both klein and SD/SDXL) --------------------------
-// Submit a job to the producer when the reference or exp changes (newest-wins), consume the freshest
-// produced keyframe+sweep into `consumer`, and present ONE credit-paced frame to outputs.image. The
-// producer thread (inside AsyncFrameProducer) owns all GPU work; this only does host memcpy + pacing.
-void StreamDiffusion::presentAsync(
-    AsyncFrameProducer<AsyncJob, AsyncFrame>& producer, PacedFrameConsumer& consumer,
-    const unsigned char* ref, bool have_input, int exp, uint64_t gen, int pacing, int w, int h,
-    bool ref_constant_hash, uint64_t& ref_hash, bool& ref_set, int& last_exp, double& last_tick_t)
-{
-  const size_t nbytes = (size_t)w * h * 4;
-
-  // Per-tick wall dt drives the credit-based FIFO drain.
-  const double tnow = now_s_steady();
-  double dt = (last_tick_t > 0.0) ? (tnow - last_tick_t) : 0.0;
-  last_tick_t = tnow;
-  dt = std::clamp(dt, 0.0, 0.1);
-
-  // Submit a fresh job whenever the reference changes (newest-wins) or the interpolation exp changes.
-  if (have_input && ref)
-  {
-    const uint64_t rh = ref_constant_hash ? 0xC0FFEEull : rapidhash(ref, nbytes);
-    if (!ref_set || rh != ref_hash)
-    {
-      AsyncJob job;
-      job.ref_rgba.assign(ref, ref + nbytes);
-      job.ref_changed = true;
-      job.w = w; job.h = h; job.exp = exp; job.gen = gen; job.valid = true;
-      producer.submit(std::move(job));
-      ref_hash = rh;
-      ref_set = true;
-    }
-    else if (exp != last_exp)
-    {
-      AsyncJob job;
-      job.ref_rgba.assign(ref, ref + nbytes);
-      job.ref_changed = false;            // ref already cached
-      job.w = w; job.h = h; job.exp = exp; job.gen = gen; job.valid = true;
-      producer.submit(std::move(job));
-    }
-    last_exp = exp;
-  }
-
-  // Consume the freshest produced keyframe+sweep into the paced FIFO.
-  const int budget_sweeps = (pacing == StreamDiffusion::Smooth) ? 3
-                          : (pacing == StreamDiffusion::Fresh)  ? 2 : 1;
-  AsyncFrame fresh;
-  if (producer.consume(fresh))
-    consumer.on_keyframe(fresh, tnow, budget_sweeps, gen);
-
-  // Present one steady-clock-paced frame (or hold the last). Nothing yet -> producer warming up.
-  const unsigned char* out_ptr = nullptr;
-  size_t out_bytes = 0;
-  if (!consumer.present(dt, out_ptr, out_bytes))
-    return;
-
-  this->outputs.image.create(w, h);
-  std::memcpy(outputs.image.texture.bytes, out_ptr, std::min<size_t>(nbytes, out_bytes));
-  outputs.image.texture.changed = true;
-}
-
-// ---- klein producer: the heavy flux2 diffusion (+RIFE) on the worker thread --------------------
-// The produce body is the ONLY caller of the flux2 C-API once started (TRT contexts are single-thread).
-// rerun_when_idle=true keeps it diffusing flat-out so the interpolating consumer always has fresh
-// keyframes; the main thread drains it (stopKleinProducer) before touching the klein contexts.
-void StreamDiffusion::ensureKleinProducer()
-{
-  if (m_klein_producer && m_klein_producer->running())
-    return;
-  if (!m_klein_producer)
-  {
-    auto produce = [this](AsyncJob& job, AsyncFrame& out) -> bool {
-      if (!job.valid || !m_klein_stream || !m_sd.flux2_stream_frame_cached)
-        return false;
-      const int w = job.w, h = job.h;
-      const size_t nb = (size_t)w * h * 4;
-      out.w = w; out.h = h; out.gen = job.gen;
-      out.rgba.assign(nb, 0);
-
-      // 1. set_reference (VAE encode) only when the ref changed; clear the flag so self-rearm reruns skip it.
-      if (job.ref_changed && m_sd.flux2_stream_set_reference)
-      {
-        if (m_sd.flux2_stream_set_reference(m_klein_stream.get(), job.ref_rgba.data())
-            != LIBREDIFFUSION_SUCCESS)
-          return false;
-        job.ref_changed = false;
-      }
-
-      // 2. diffuse the keyframe (~150ms 2-step denoise+decode on the klein stream's low-prio stream).
-      if (m_sd.flux2_stream_frame_cached(m_klein_stream.get(), out.rgba.data())
-          != LIBREDIFFUSION_SUCCESS)
-        return false;
-
-      // 3. RIFE the sweep prev->cur on this thread (lazy handle create; sequential -> no stream contention).
-      if (job.exp > 0 && m_klein_have_prev_key)
-      {
-        if (!m_klein_producer_rife && !m_klein_rife_path.empty())
-        {
-          m_klein_producer_rife = SDRife{m_klein_rife_path.c_str()};
-          if (m_klein_producer_rife && m_sd.rife_set_enabled)
-            m_sd.rife_set_enabled(m_klein_producer_rife.get(), 1);
-        }
-        if (m_klein_producer_rife && m_sd.rife_set_interpolation_exp)
-          m_sd.rife_set_interpolation_exp(m_klein_producer_rife.get(), job.exp);
-        if (m_klein_producer_rife && m_sd.rife_interpolate && m_klein_prev_key.size() >= nb)
-        {
-          const int n_max = 1 << job.exp;
-          out.sweep.assign((size_t)n_max * nb, 0);
-          int n = 0;
-          if (m_sd.rife_interpolate(m_klein_producer_rife.get(), m_klein_prev_key.data(),
-                                    out.rgba.data(), h, w, out.sweep.data(), &n)
-                  == LIBREDIFFUSION_SUCCESS && n > 0)
-            out.sweep_n = n;
-          else { out.sweep.clear(); out.sweep_n = 0; }
-        }
-      }
-
-      // 4. remember this keyframe as the next sweep's prev (producer-thread-only state).
-      m_klein_prev_key = out.rgba;
-      m_klein_have_prev_key = true;
-      return true;
-    };
-    m_klein_producer = std::make_unique<AsyncFrameProducer<AsyncJob, AsyncFrame>>(
-        std::move(produce), /*rerun_when_idle=*/true);
-  }
-  m_klein_producer->start();
-}
-
-void StreamDiffusion::stopKleinProducer()
-{
-  if (m_klein_producer)
-    m_klein_producer->stop();
-  m_klein_consumer.reset();
-  m_klein_have_prev_key = false;
-  m_klein_prev_key.clear();
-  m_klein_async_ref_set = false;
-  m_klein_async_ref_hash = 0;
-  m_klein_async_exp = -1;
-  m_klein_last_tick_t = 0.0;
-}
-
-// The workflow left klein: nothing else in operator() ever stops the producer, which would keep
-// diffusing flat out (rerun_when_idle=true) and holding ~10 GB of VRAM while the node renders SD.
-void StreamDiffusion::releaseKleinResources()
-{
-  if (!m_klein_stream && !m_klein_producer && !m_rife && !m_klein_producer_rife)
-    return;   // nothing to release -- the common per-tick path
-
-  stopKleinProducer();          // drain + join before anything it touches is destroyed
-  m_klein_producer.reset();
-  m_klein_producer_rife.reset();
-  m_rife.reset();
-  m_klein_stream.reset();
-
-  m_klein_model_path.clear();
-  m_klein_quality = -1;
-  m_klein_seed = 0;
-  m_klein_w = 0;
-  m_klein_h = 0;
-  m_klein_prompt.clear();
-  m_klein_sched.clear();
-  m_klein_mask_hash = 0;
-  m_klein_prev_out.clear();
-  m_klein_have_prev = false;
-  m_klein_ref_hash = 0;
-  m_klein_ref_set = false;
-  m_klein_queue.clear();
-  m_klein_last_exp = -1;
-  ++m_klein_gen;                // invalidate anything still in flight from the old configuration
-}
-
-// Same for the img2img-turbo pipeline: engines + CLIP encoder + device embedding.
-void StreamDiffusion::releaseTurboResources()
-{
-  if (!m_i2it && !m_i2it_clip && !m_i2it_embeddings)
-    return;
-
-  m_i2it.reset();
-  m_i2it_clip = SDClip{};
-  m_i2it_embeddings.reset();
-  m_i2it_model_path.clear();
-  m_i2it_prompt.clear();
-  m_i2it_in.clear();
-  m_i2it_in.shrink_to_fit();
-  m_i2it_out.clear();
-  m_i2it_out.shrink_to_fit();
-}
-
-void StreamDiffusion::runKlein(const inputs_t& in_config)
-{
-  if (!m_sd.available || !m_sd.flux2_stream_create)
-  {
-    std::fprintf(stderr, "FLUX.2-klein: library does not export the flux2 streaming API\n");
-    noteSetupFailure(in_config);
-    return;
-  }
-
-  int w = 0, h = 0;
-  if (!resolveResolution(in_config, w, h))
-    return;
-  w = std::max(16, (w / 16) * 16);
-  h = std::max(16, (h / 16) * 16);
-  const int quality = static_cast<int>(in_config.klein_quality.value);
-
-  // (Re)create the stream pipeline when the model / resolution / quality / seed changes. The seed
-  // is baked in at creation and the flux2 API has no reseed entry point, so a seed change means a
-  // full re-create; the engines come back from the library's own cache.
-  const bool need_new
-      = !m_klein_stream || m_klein_model_path != in_config.model.value
-        || m_klein_quality != quality || m_klein_w != w || m_klein_h != h
-        || m_klein_seed != kleinSeed(in_config);
-  if (need_new)
-  {
-    // createKleinStream() drains+joins the producer before destroying the old stream handle, so
-    // there is no use-after-free even if a keyframe was mid-flight. This is HEAVY (engine (re)load +
-    // producer join) and runs on the GUI thread -> a freeze here is expected ONLY on real config change.
-    if (!createKleinStream(in_config))
-    {
-      noteSetupFailure(in_config);
-      return;
-    }
-    w = m_klein_w;
-    h = m_klein_h;
-  }
-
-  // (Re)create the RIFE interpolator on demand (opt-in via rife_exp > 0).
-  // IMPORTANT: in ASYNC mode the PRODUCER thread owns its OWN RIFE handle (m_klein_producer_rife) and
-  // runs RIFE itself. Loading a SECOND RIFE engine here on the render side would double the RIFE VRAM
-  // (~1.3GB each at the wide dynamic profile) and contend on the GPU -> the ~1fps + "rife_create failed"
-  // the user saw. So only create the render-side m_rife for the SYNC path.
-  const int exp = std::clamp((int)in_config.rife_exp.value, 0, 3);
-  const bool async_mode = in_config.klein_async.value
-      && m_sd.flux2_stream_set_reference && m_sd.flux2_stream_frame_cached;
-  if (!async_mode && exp > 0 && m_sd.rife_create)
-  {
-    if (!m_rife)
-    {
-      std::string rife_engine = in_config.model.value + "/rife_ifnet_fp16.plan";
-      if (!file_exists(rife_engine))
-        rife_engine = "/media/data2/flux-trt/engine-rife/rife_ifnet_fp16.plan";
-      m_rife = SDRife{rife_engine.c_str()};
-    }
-    if (m_rife && m_sd.rife_set_enabled)
-    {
-      m_sd.rife_set_enabled(m_rife.get(), 1);
-      if (m_sd.rife_set_interpolation_exp)
-        m_sd.rife_set_interpolation_exp(m_rife.get(), exp);
-    }
-  }
-  else if (m_rife && m_sd.rife_set_enabled)
-  {
-    m_sd.rife_set_enabled(m_rife.get(), 0);
-  }
-
-  // Prompt -> (re)encode the cached Qwen embeds (no-op if unchanged).
-  if (in_config.prompt.value.empty())
-    return;
-  if (m_klein_prompt != in_config.prompt.value)
-  {
-    // set_prompt touches the Qwen TRT context, which in async mode is owned by the producer thread.
-    // Drain+join the producer first so the context is never touched from two threads (it restarts
-    // lazily in runKleinAsync). This JOIN blocks the GUI thread until the in-flight keyframe finishes
-    // (~150ms) -> a freeze. Should fire ONLY when the prompt actually changes; if it logs every tick,
-    // the prompt input is oscillating (the real bug).
-    stopKleinProducer();              // drain+join (also resets the consumer + prev-key); restarts lazily
-    if (m_sd.flux2_stream_set_prompt
-        && m_sd.flux2_stream_set_prompt(
-               m_klein_stream.get(), in_config.prompt.value.c_str())
-               < 0)
-    {
-      std::fprintf(stderr, "FLUX.2-klein: set_prompt failed\n");
-      noteSetupFailure(in_config);
-      return;
-    }
-    m_klein_prompt = in_config.prompt.value;
-    m_klein_queue.clear();            // sync path: new prompt -> don't show stale interpolated frames
-  }
-  noteSetupSuccess();   // stream + prompt are live for this input set
-
-  // Timesteps control -> klein FlowMatch sigma schedule (native scale, high->low in (0,1]). It SUBSUMES
-  // steps + strength: list length = steps, first value = start noise level (=img2img strength). Falls
-  // back to the natural 2-step when the field isn't a valid klein sigma list (e.g. the SD-style "15, 25"
-  // default, or integers > 1). set_schedule mutates the stream schedule the producer thread reads in
-  // denoise_decode_ref, so drain+join the producer first (same threading reason as set_prompt above).
-  if (m_klein_sched != in_config.t1.value)
-  {
-    stopKleinProducer();
-    auto sigmas = get_sigmas(in_config.t1.value);
-    if (!sigmas.empty() && m_sd.flux2_stream_set_schedule)
-      m_sd.flux2_stream_set_schedule(
-          m_klein_stream.get(), sigmas.data(), (int)sigmas.size());
-    else if (m_sd.flux2_stream_set_steps)
-      m_sd.flux2_stream_set_steps(m_klein_stream.get(), 2);  // natural dynamic-shift 2-step
-    m_klein_sched = in_config.t1.value;
-    m_klein_queue.clear();
-  }
-
-  // Inpaint mask: klein has no ControlNet/IP-Adapter, so the "Control / Style" texture is repurposed as
-  // the inpaint mask (white = regenerate, black = keep; absent = no inpaint). set_mask mutates the
-  // stream mask the producer reads, so drain+join first (same reason as set_prompt/set_schedule).
-  {
-    const bool inpaint = (in_config.workflow == Workflow::FLUX2_KLEIN_INPAINT);
-    const auto& mt = in_config.control.texture;
-    const uint64_t mh = (inpaint && mt.width > 0 && mt.height > 0 && mt.bytes)
-        ? rapidhash(mt.bytes, (size_t)mt.width * mt.height * 4) : 0ull;
-    if (mh != m_klein_mask_hash && m_sd.flux2_stream_set_mask)
-    {
-      stopKleinProducer();
-      if (mh != 0)
-      {
-        lo::rgba_image mimg(mt.bytes, mt.width, mt.height);
-        if (mt.width != m_klein_w || mt.height != m_klein_h)
-          mimg = mimg.scaled({m_klein_w, m_klein_h});
-        m_sd.flux2_stream_set_mask(m_klein_stream.get(), mimg.constBits(), m_klein_h, m_klein_w);
-      }
-      else
-        m_sd.flux2_stream_set_mask(m_klein_stream.get(), nullptr, 0, 0);  // no mask -> disable inpaint
-      m_klein_mask_hash = mh;
-      m_klein_queue.clear();
-    }
-  }
-
-  const int exp_now = std::clamp((int)in_config.rife_exp.value, 0, 3);
-  if (exp_now != m_klein_last_exp)
-  {
-    m_klein_queue.clear(); // interpolation factor changed -> flush the queue
-    m_klein_last_exp = exp_now;
-  }
-
-  // Async (Phase C): diffusion runs on a dedicated producer thread (low-prio stream); the render
-  // thread emits one steady-clock-paced, precomputed RIFE sub-frame per tick (fluid, never blocks).
-  // Falls back to the sync path below if the cached reference API is absent.
-  if (in_config.klein_async.value
-      && m_sd.flux2_stream_set_reference && m_sd.flux2_stream_frame_cached)
-  {
-    runKleinAsync(in_config);
-    return;
-  }
-  // Left async -> ensure the producer is stopped so the sync path owns the contexts exclusively.
-  if (m_klein_producer && m_klein_producer->running())
-    stopKleinProducer();
-
-  // ---- Task 2: RIFE display decoupling --------------------------------------------------------
-  // When interpolation is on (exp>0), we emit ONE frame per tick from a queue and only run a real
-  // diffusion when the queue is empty (i.e. once per ~2^exp ticks). Between real frames the GPU is
-  // free — diffusion runs only when necessary. When exp==0 the queue holds a single freshly-diffused
-  // frame each tick (full diffusion rate, unchanged behaviour).
-  if (!m_klein_queue.empty())
-  {
-    // Still have interpolated frames to show — emit one, no diffusion this tick.
-    this->outputs.image.create(w, h);
-    std::memcpy(
-        outputs.image.texture.bytes, m_klein_queue.front().data(), (size_t)w * h * 4);
-    outputs.image.texture.changed = true;
-    m_klein_queue.pop_front();
-    return;
-  }
-
-  // Queue empty -> we need a new REAL frame. Build the reference and (re)encode only if it changed.
-  //  - IMG2IMG: the incoming texture (scaled to w x h), as a reference image.
-  //  - TXT2IMG: a neutral (black) reference frame (hashes constant -> encoded once).
-  static thread_local std::vector<unsigned char> ref_frame;
-  ref_frame.assign((size_t)w * h * 4, 0);
-
-  if (in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG
-      || in_config.workflow == Workflow::FLUX2_KLEIN_INPAINT)
-  {
-    if (inputs.image.texture.width <= 0 || inputs.image.texture.height <= 0
-        || !inputs.image.texture.bytes)
-      return;
-
-    lo::rgba_image in(
-        inputs.image.texture.bytes, inputs.image.texture.width,
-        inputs.image.texture.height);
-    if (inputs.image.texture.width != w || inputs.image.texture.height != h)
-      in = in.scaled({w, h});
-
-    const size_t bytes = std::min<size_t>((size_t)w * h * 4, in.sizeInBytes());
-    std::memcpy(ref_frame.data(), in.constBits(), bytes);
-  }
-
-  // Task 1: VAE-encode the reference ONLY when it changed (hash the bytes, like the IP-Adapter
-  // style path). Falls back to the legacy one-shot flux2_stream_frame if the cached API is absent.
-  static thread_local std::vector<unsigned char> out_frame;
-  out_frame.assign((size_t)w * h * 4, 0);
-
-  if (m_sd.flux2_stream_set_reference && m_sd.flux2_stream_frame_cached)
-  {
-    const uint64_t rh = rapidhash(ref_frame.data(), (size_t)w * h * 4);
-    if (!m_klein_ref_set || rh != m_klein_ref_hash)
-    {
-      if (m_sd.flux2_stream_set_reference(m_klein_stream.get(), ref_frame.data())
-          != LIBREDIFFUSION_SUCCESS)
-      {
-        std::fprintf(stderr, "FLUX.2-klein: set_reference failed\n");
-        return;
-      }
-      m_klein_ref_hash = rh;
-      m_klein_ref_set = true;
-    }
-    auto err = m_sd.flux2_stream_frame_cached(m_klein_stream.get(), out_frame.data());
-    if (err != LIBREDIFFUSION_SUCCESS)
-    {
-      std::fprintf(stderr, "FLUX.2-klein: stream_frame_cached failed %d\n", (int)err);
-      return;
-    }
-  }
-  else
-  {
-    // Legacy path (older .so): encode every frame. flux2_stream_frame is an OPTIONAL symbol, and a
-    // .so exporting neither it nor the cached-reference API lands here.
-    if (!m_sd.flux2_stream_frame)
-    {
-      std::fprintf(stderr, "FLUX.2-klein: the librediffusion .so exports neither "
-                  "flux2_stream_frame_cached nor flux2_stream_frame\n");
-      return;
-    }
-    auto err = m_sd.flux2_stream_frame(
-        m_klein_stream.get(), ref_frame.data(), out_frame.data());
-    if (err != LIBREDIFFUSION_SUCCESS)
-    {
-      std::fprintf(stderr, "FLUX.2-klein: stream_frame failed %d\n", (int)err);
-      return;
-    }
-  }
-
-  // Build this tick's output queue.
-  if (exp_now <= 0 || !m_rife || !m_sd.rife_interpolate || !m_klein_have_prev)
-  {
-    // No interpolation (or first real frame): emit the single real frame this tick.
-    m_klein_queue.clear();
-    m_klein_queue.emplace_back(out_frame);
-  }
-  else
-  {
-    // Interpolate prev_real -> cur into 2^exp display-ordered frames; queue them all.
-    const int n_max = 1 << exp_now;
-    m_rife_scratch.assign((size_t)n_max * w * h * 4, 0);
-    int n = 0;
-    auto rerr = m_sd.rife_interpolate(
-        m_rife.get(), m_klein_prev_out.data(), out_frame.data(), h, w,
-        m_rife_scratch.data(), &n);
-    m_klein_queue.clear();
-    if (rerr == LIBREDIFFUSION_SUCCESS && n > 0)
-    {
-      for (int i = 0; i < n; ++i)
-      {
-        const unsigned char* f = m_rife_scratch.data() + (size_t)i * w * h * 4;
-        m_klein_queue.emplace_back(f, f + (size_t)w * h * 4);
-      }
-    }
-    else
-    {
-      m_klein_queue.emplace_back(out_frame); // RIFE failed -> just the real frame
-    }
-  }
-
-  // Remember this real frame for the next RIFE pass, then emit the first queued frame.
-  m_klein_prev_out = out_frame;
-  m_klein_have_prev = true;
-
-  this->outputs.image.create(w, h);
-  std::memcpy(outputs.image.texture.bytes, m_klein_queue.front().data(), (size_t)w * h * 4);
-  outputs.image.texture.changed = true;
-  m_klein_queue.pop_front();
-
-  m_prev_inputs = inputs;
-}
-
-// github.com/GaParmar/img2img-turbo: one-step image translation through the self-contained skip-VAE
-// C-API. Host RGBA bytes in/out (the C-API does the device work internally, like klein's
-// flux2_stream_frame). The CLIP text embedding comes from the "Embedding" buffer inlet (upstream
-// prompt-encoder, or a baked CycleGAN constant) — no CLIP in this node. Synchronous.
-void StreamDiffusion::runImg2ImgTurbo(const inputs_t& in_config)
-{
-  if (!m_sd.available || !m_sd.img2img_turbo_create || !m_sd.img2img_turbo_frame_sized
-      || !m_sd.img2img_turbo_frame_bytes || !m_sd.img2img_turbo_ehs_elements)
-  {
-    std::fprintf(stderr, "img2img-turbo: library does not export the img2img-turbo API\n");
-    noteSetupFailure(in_config);
-    return;
-  }
-
-  // (Re)create the pipeline when the model (engine folder) changes.
-  if (!m_i2it || m_i2it_model_path != in_config.model.value)
-  {
-    const std::string unet = in_config.model.value + "/unet.engine";
-    const std::string venc = in_config.model.value + "/vae_encoder.engine";
-    const std::string vdec = in_config.model.value + "/vae_decoder.engine";
-    m_i2it = SDImg2ImgTurbo{unet.c_str(), venc.c_str(), vdec.c_str()};
-    m_i2it_model_path = in_config.model.value;
-    if (!m_i2it)
-    {
-      std::fprintf(stderr, "img2img-turbo: create failed for %s\n", in_config.model.value.c_str());
-      noteSetupFailure(in_config);
-      return;
-    }
-    // CLIP encoder so the embedding can be derived from the Prompt (sd-turbo, pad 0, dim 1024).
-    const std::string clip = in_config.model.value + "/clip.engine";
-    m_i2it_clip = SDClip{clip.c_str(), m_config_state.device};
-    m_i2it_embeddings.reset();
-    m_i2it_prompt.clear();
-  }
-
-  noteSetupSuccess();   // the turbo pipeline is live for this input set
-
-  // The geometry is the ENGINES', not the 512x512 constant this was written against: on any other
-  // export the old code scaled to 512, allocated 512*512*4 and handed those buffers to entry points
-  // that read and write the engine's own size (L-03). Ask the library, and size everything from it.
-  const size_t frame_bytes = (size_t)m_sd.img2img_turbo_frame_bytes(m_i2it.get());
-  const size_t ehs_elems = (size_t)m_sd.img2img_turbo_ehs_elements(m_i2it.get());
-  int w = 0, h = 0;
-  if (frame_bytes == 0 || ehs_elems == 0
-      || m_sd.img2img_turbo_frame_size(m_i2it.get(), &w, &h) != LIBREDIFFUSION_SUCCESS
-      || w <= 0 || h <= 0)
-  {
-    std::fprintf(
-        stderr, "img2img-turbo: engine reports %dx%d, %zu bytes/frame, %zu ehs elements\n", w, h,
-        frame_bytes, ehs_elems);
-    return;
-  }
-
-  // Recompute the prompt-derived embedding only when the prompt changes.
-  if (m_i2it_clip && m_i2it_prompt != in_config.prompt.value)
-  {
-    m_i2it_embeddings.reset();
-    librediffusion_error_t cerr = m_sd.clip_compute_embeddings(
-        m_i2it_clip.get(), in_config.prompt.value.c_str(), 0, nullptr,
-        &m_i2it_embeddings.embeddings);
-    if (cerr != LIBREDIFFUSION_SUCCESS)
-      m_i2it_embeddings.embeddings = nullptr;
-    m_i2it_prompt = in_config.prompt.value;
-  }
-
-  // Input frame -> the engine's RGBA8 (Canny / any preprocessing is upstream; In goes in as-is).
-  if (inputs.image.texture.width <= 0 || inputs.image.texture.height <= 0
-      || !inputs.image.texture.bytes)
-    return;
-  m_i2it_in.assign(frame_bytes, 0);
-  lo::rgba_image in(
-      inputs.image.texture.bytes, inputs.image.texture.width, inputs.image.texture.height);
-  if (inputs.image.texture.width != w || inputs.image.texture.height != h)
-    in = in.scaled({w, h});
-  std::memcpy(
-      m_i2it_in.data(), in.constBits(), std::min<size_t>(frame_bytes, in.sizeInBytes()));
-
-  // Embedding: the explicit "Embedding" port overrides; otherwise use the prompt-derived device
-  // fp16 from CLIP. Skip the frame if neither is available.
-  m_i2it_out.assign(frame_bytes, 0);
-  librediffusion_error_t err = LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
-  if (inputs.ehs.value.size() >= ehs_elems)
-  {
-    err = m_sd.img2img_turbo_frame_sized(
-        m_i2it.get(), m_i2it_in.data(), m_i2it_in.size(), inputs.ehs.value.data(),
-        inputs.ehs.value.size(), m_i2it_out.data(), m_i2it_out.size());
-  }
-  else if (m_i2it_embeddings.embeddings && m_sd.img2img_turbo_frame_dev_sized)
-  {
-    err = m_sd.img2img_turbo_frame_dev_sized(
-        m_i2it.get(), m_i2it_in.data(), m_i2it_in.size(), m_i2it_embeddings.embeddings,
-        m_i2it_out.data(), m_i2it_out.size());
-  }
-  else
-  {
-    return; // nothing to translate without a text embedding
-  }
-  if (err != LIBREDIFFUSION_SUCCESS)
-  {
-    std::fprintf(stderr, "img2img-turbo: frame failed %d\n", (int)err);
-    return;
-  }
-
-  this->outputs.image.create(w, h);
-  std::memcpy(outputs.image.texture.bytes, m_i2it_out.data(), frame_bytes);
-  outputs.image.texture.changed = true;
-
-  m_prev_inputs = inputs;
-}
-
-// Phase C — steady-clock paced async klein. Diffusion (+RIFE) runs on the producer thread on the klein
-// stream's own low-prio CUDA stream; the render thread (this fn, once per score tick) NEVER blocks. The
-// producer + credit-paced consumer are the SHARED AsyncFrameProducer/PacedFrameConsumer (see
-// presentAsync); this fn only builds the reference frame and hands off.
-void StreamDiffusion::runKleinAsync(const inputs_t& in_config)
-{
-  const int w = m_klein_w, h = m_klein_h;
-  const size_t nbytes = (size_t)w * h * 4;
-  const int exp = std::clamp((int)in_config.rife_exp.value, 0, 3);
-  const int pacing = static_cast<int>(in_config.klein_pacing.value);
-
-  ensureKleinProducer();   // lazily (re)started; createKleinStream / set_prompt stop it on change.
-
-  // Build this tick's reference frame (img2img: input texture scaled to model res; txt2img: black).
-  static thread_local std::vector<unsigned char> ref_frame;
-  ref_frame.assign(nbytes, 0);
-  bool have_input = true;
-  const bool img2img = (in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG
-                        || in_config.workflow == Workflow::FLUX2_KLEIN_INPAINT);
-  if (img2img)
-  {
-    if (inputs.image.texture.width <= 0 || inputs.image.texture.height <= 0
-        || !inputs.image.texture.bytes)
-      have_input = false;
-    else
-    {
-      lo::rgba_image in(
-          inputs.image.texture.bytes, inputs.image.texture.width,
-          inputs.image.texture.height);
-      if (inputs.image.texture.width != w || inputs.image.texture.height != h)
-        in = in.scaled({w, h});
-      std::memcpy(ref_frame.data(), in.constBits(), std::min<size_t>(nbytes, in.sizeInBytes()));
-    }
-  }
-
-  // txt2img: the black reference hashes constant -> submitted once (ref_constant_hash=true).
-  presentAsync(
-      *m_klein_producer, m_klein_consumer, ref_frame.data(), have_input, exp, m_klein_gen, pacing,
-      w, h, /*ref_constant_hash=*/!img2img,
-      m_klein_async_ref_hash, m_klein_async_ref_set, m_klein_async_exp, m_klein_last_tick_t);
-}
-
-// --- Generic async (option A) for SD/SD-turbo/SDXS/SDXL: plain txt2img/img2img ---------------------
-// Same producer/consumer machinery as klein, but the produce body calls the SD pipeline's blocking
-// txt2img/img2img (which already run on the pipeline's own CUDA stream and sync internally before
-// returning the host RGBA). The worker thread is the SOLE caller of the pipeline once started; the
-// main thread drains it (stopSDProducer) before any context mutation. CN/IP excluded (per-tick cond).
-
-bool StreamDiffusion::sdAsyncEligible(int8_t wf) noexcept
-{
-  switch (wf)
-  {
-    case StreamDiffusion::Workflow::SD_TXT2IMG:
-    case StreamDiffusion::Workflow::SDTURBO_TXT2IMG:
-    case StreamDiffusion::Workflow::SDXL_TXT2IMG:
-    case StreamDiffusion::Workflow::V2V_TXT2IMG:
-    case StreamDiffusion::Workflow::SD_IMG2IMG:
-    case StreamDiffusion::Workflow::SDTURBO_IMG2IMG:
-    case StreamDiffusion::Workflow::SDXL_IMG2IMG:
-    case StreamDiffusion::Workflow::V2V_IMG2IMG:
-      return true;
-    default:
-      return false;
-  }
-}
-
-void StreamDiffusion::ensureSDProducer()
-{
-  if (m_sd_producer && m_sd_producer->running())
-    return;
-  if (!m_sd_producer)
-  {
-    // The produce body runs on the worker thread and is the ONLY caller of the pipeline while running.
-    auto produce = [this](AsyncJob& job, AsyncFrame& out) -> bool {
-      if (!m_cached_engine || !m_cached_engine->pipeline)
-        return false;
-      auto pipe = m_cached_engine->pipeline->get();
-      const int w = job.w, h = job.h;
-      const size_t nb = (size_t)w * h * 4;
-      if (nb == 0)
-        return false;
-      out.w = w; out.h = h; out.gen = job.gen;
-      out.rgba.assign(nb, 0);
-
-      // 1. Diffuse the keyframe (blocking; the pipeline's own stream syncs internally before return).
-      bool diffused = false;
-      if (m_sd_async_img2img)
-      {
-        if (job.ref_rgba.size() < nb)
-          return false;
-        diffused = (m_sd.img2img(pipe, job.ref_rgba.data(), out.rgba.data(), w, h)
-                    == LIBREDIFFUSION_SUCCESS);
-      }
-      else
-      {
-        diffused = (m_sd.txt2img(pipe, out.rgba.data(), w, h) == LIBREDIFFUSION_SUCCESS);
-      }
-      if (!diffused)
-        return false;
-
-      // 2. RIFE the sweep prev->cur ON THIS THREAD (graceful: if the engine can't run at this
-      //    resolution, fall back to the single keyframe -> async still smooths pacing, just no interp).
-      if (job.exp > 0 && m_sd_have_prev_key)
-      {
-        if (!m_sd_producer_rife && !m_sd_rife_path.empty())
-        {
-          m_sd_producer_rife = SDRife{m_sd_rife_path.c_str()};
-          if (m_sd_producer_rife && m_sd.rife_set_enabled)
-            m_sd.rife_set_enabled(m_sd_producer_rife.get(), 1);
-        }
-        if (m_sd_producer_rife && m_sd.rife_set_interpolation_exp)
-          m_sd.rife_set_interpolation_exp(m_sd_producer_rife.get(), job.exp);
-        if (m_sd_producer_rife && m_sd.rife_interpolate
-            && m_sd_prev_key.size() >= nb)
-        {
-          const int n_max = 1 << job.exp;
-          out.sweep.assign((size_t)n_max * nb, 0);
-          int n = 0;
-          if (m_sd.rife_interpolate(m_sd_producer_rife.get(), m_sd_prev_key.data(),
-                                    out.rgba.data(), h, w, out.sweep.data(), &n)
-                  == LIBREDIFFUSION_SUCCESS && n > 0)
-            out.sweep_n = n;
-          else { out.sweep.clear(); out.sweep_n = 0; }
-        }
-      }
-
-      // 3. Remember this keyframe as the next sweep's prev (producer-thread-only state).
-      m_sd_prev_key = out.rgba;
-      m_sd_have_prev_key = true;
-      return true;
-    };
-    // rerun_when_idle = false: SD output is deterministic for a fixed (ref, seed); don't peg the GPU
-    // re-generating an identical frame. Live img2img submits a fresh job whenever the input moves.
-    m_sd_producer = std::make_unique<AsyncFrameProducer<AsyncJob, AsyncFrame>>(
-        std::move(produce), /*rerun_when_idle=*/false);
-  }
-
-  // Resolve the RIFE engine path once (model folder, else the shared fallback engine).
-  if (m_sd_rife_path.empty())
-  {
-    std::string rp = m_klein_model_path.empty()
-        ? std::string() : (m_klein_model_path + "/rife_ifnet_fp16.plan");
-    if (rp.empty() || !file_exists(rp))
-      rp = "/media/data2/flux-trt/engine-rife/rife_ifnet_fp16.plan";
-    m_sd_rife_path = rp;
-  }
-  m_sd_producer->start();
-}
-
-void StreamDiffusion::stopSDProducer()
-{
-  if (m_sd_producer)
-    m_sd_producer->stop();
-  m_sd_consumer.reset();
-  m_sd_have_prev_key = false;
-  m_sd_prev_key.clear();
-  m_sd_producer_rife.reset();   // resolution may change on rebuild -> reload lazily
-  m_sd_async_ref_set = false;
-  m_sd_async_ref_hash = 0;
-  m_sd_async_exp = -1;
-  m_sd_last_tick_t = 0.0;
-}
-
-void StreamDiffusion::runSDAsync(
-    const inputs_t& in_config, unsigned char* input_tex_bytes, int w, int h)
-{
-  if (w <= 0 || h <= 0)
-    return;
-  const size_t nbytes = (size_t)w * h * 4;
-  const int exp = std::clamp((int)in_config.rife_exp.value, 0, 3);
-
-  // img2img iff not one of the four txt2img workflows (sdAsyncEligible already gated to these 8).
-  // Only assign while the producer is stopped — the worker reads this field, and a workflow change
-  // always drains the producer first (need_rebuild), so it stays stable+correct while running.
-  const bool img2img = !(in_config.workflow == Workflow::SD_TXT2IMG
-                         || in_config.workflow == Workflow::SDTURBO_TXT2IMG
-                         || in_config.workflow == Workflow::SDXL_TXT2IMG
-                         || in_config.workflow == Workflow::V2V_TXT2IMG);
-  if (!(m_sd_producer && m_sd_producer->running()))
-    m_sd_async_img2img = img2img;
-
-  ensureSDProducer();
-
-  // Build this tick's reference frame. img2img: the (already model-res-scaled) input texture from
-  // operator(); txt2img: a constant black frame (hashes constant -> submitted once).
-  static thread_local std::vector<unsigned char> ref_frame;
-  ref_frame.assign(nbytes, 0);
-  bool have_input = true;
-  if (m_sd_async_img2img)
-  {
-    if (!input_tex_bytes)
-      have_input = false;
-    else
-      std::memcpy(ref_frame.data(), input_tex_bytes, nbytes);
-  }
-
-  const int pacing = static_cast<int>(in_config.klein_pacing.value);
-
-  // Shared render-side driver: submit on ref/exp change, consume, present one paced frame.
-  presentAsync(
-      *m_sd_producer, m_sd_consumer, ref_frame.data(), have_input, exp, m_sd_gen, pacing, w, h,
-      /*ref_constant_hash=*/!m_sd_async_img2img,
-      m_sd_async_ref_hash, m_sd_async_ref_set, m_sd_async_exp, m_sd_last_tick_t);
-}
-
-// A NaN never equals itself, so every `m_prev_inputs.x != in_config.x` change gate below fires on
-// every tick for a NaN knob, pushing it into the pipeline unvalidated. inf/NaN also reaches
-// int(feed_prev * 256.f), where the cast is UB.
+// A NaN never equals itself, so every `m_prev_inputs.x != in.x` change gate would fire on every
+// tick for a NaN knob; inf/NaN also reach int(feed_prev * 256.f), where the cast is UB.
 void StreamDiffusion::sanitizeControls()
 {
   const auto fix = [](float& v, float fallback) {
@@ -2301,464 +414,1126 @@ void StreamDiffusion::sanitizeControls()
   fix(inputs.ipadapter_scale.value, 0.7f);
   fix(inputs.lora_scale.value, 1.0f);
 
-  // These two feed fixed-point blend arithmetic (int(v * 256.f)); out of [0,1] the weights stop
-  // meaning anything. The others reach the library as-is: clamping them to the widget range would
-  // silently change a user's automation.
+  // These two feed fixed-point blend arithmetic; the others reach the library as-is.
   inputs.feed_prev_in.value = std::clamp(inputs.feed_prev_in.value, 0.0f, 1.0f);
   inputs.feed_prev_out.value = std::clamp(inputs.feed_prev_out.value, 0.0f, 1.0f);
+  inputs.gpu.value = std::max(0, inputs.gpu.value);
 }
 
+// -------------------------------------------------------------------------------------------------
+// Per tick
+// -------------------------------------------------------------------------------------------------
 void StreamDiffusion::operator()()
 {
-  // Check library availability
-  if (!m_sd.available)
-    return;
-
   sanitizeControls();
+  // One-shot values are consumed by the tick that received them, whatever the host does with them
+  // afterwards (score clears them after the run; other back-ends may not).
+  const bool build_requested = inputs.build.value.has_value();
+  const bool triggered = inputs.trigger.value.has_value();
+  inputs.build.value.reset();
+  inputs.trigger.value.reset();
 
-  const auto& in_config = this->inputs;
-
-  // Release the self-contained pipelines the current workflow does NOT use, before anything can
-  // return early: they own a worker thread and gigabytes of VRAM.
-  const bool klein_workflow
-      = in_config.workflow == Workflow::FLUX2_KLEIN_TXT2IMG
-        || in_config.workflow == Workflow::FLUX2_KLEIN_IMG2IMG
-        || in_config.workflow == Workflow::FLUX2_KLEIN_INPAINT;
-  if(!klein_workflow)
-    releaseKleinResources();
-  if(in_config.workflow != Workflow::IMG2IMG_TURBO)
-    releaseTurboResources();
-
-  if(in_config.model.value.empty())
+  // The builder is pure host code: engines can be built before the runtime library is usable.
+  builderTick(inputs, build_requested);
+  if(!m_sd.available)
     return;
 
-  // An input set that already failed to set up is not retried until one of the inputs that could
-  // change the outcome actually changes.
-  if(setupBlocked(in_config))
-    return;
-
-  // FLUX.2-klein has its own self-contained streaming pipeline (separate engines,
-  // tokenizer, scheduler and noise handled inside the C-API). It does not use the
-  // SD pipeline / CLIP / EngineCache machinery, so dispatch it early.
-  if(klein_workflow)
+  const inputs_t& in = inputs;
+  const Family family = familyOf(in.workflow.value);
+  if(family != m_family || in.gpu.value != m_device)
   {
-    runKlein(in_config);
-    return;
-  }
-
-  // img2img-turbo likewise has its own self-contained skip-VAE C-API (no SD pipeline / CLIP / scheduler).
-  if(in_config.workflow == Workflow::IMG2IMG_TURBO)
-  {
-    runImg2ImgTurbo(in_config);
-    return;
-  }
-
-  // Check for configuration changes that require pipeline recreation
-  const auto prev_t1 = get_steps(m_prev_inputs.t1.value);
-  const auto new_t1 = get_steps(in_config.t1.value);
-  if (!new_t1 || new_t1->empty())
-  {
-    std::fprintf(
-        stderr, "StreamDiffusion: Timesteps \"%s\" %s\n", in_config.t1.value.c_str(),
-        new_t1 ? "contains no step" : "could not be parsed");
-    noteSetupFailure(in_config);
-    return;
-  }
-  const auto n_prev_t1 = prev_t1 ? prev_t1->size() : std::size_t(0);
-  const auto n_new_t1 = new_t1->size();
-  
-  bool need_rebuild = false;
-  bool need_update_scheduler = false;
-  bool need_update_positive_embeds = false;
-  bool need_update_negative_embeds = false;
-  bool need_reseed = false;
-  bool need_update_guidance = false;
-  bool need_update_delta = false;
-  bool need_update_lora = false;
-  if (n_prev_t1 != n_new_t1 || n_new_t1 <= 0)
-    need_rebuild = true;
-  if (m_prev_inputs.add_noise.value != in_config.add_noise.value)
-    need_rebuild = true;
-  if (m_prev_inputs.denoise_batch.value != in_config.denoise_batch.value)
-    need_rebuild = true;
-  if (m_prev_inputs.model.value != in_config.model.value)
-    need_rebuild = true;
-  if (m_prev_inputs.workflow.value != in_config.workflow.value)
-    need_rebuild = true;
-  if (m_prev_inputs.size.value.x != in_config.size.value.x)
-    need_rebuild = true;
-  if (m_prev_inputs.size.value.y != in_config.size.value.y)
-    need_rebuild = true;
-  if (m_prev_inputs.cfg.value != in_config.cfg.value)
-    need_rebuild = true;
-  if(std::signbit(m_prev_inputs.guidance.value - 1.) != std::signbit(in_config.guidance.value - 1.))
-    need_rebuild = true;
-
-  if (m_prev_inputs.t1.value != in_config.t1.value)
-    need_update_scheduler = true;
-  if (m_prev_inputs.prompt.value != in_config.prompt.value || m_embeddings.empty())
-    need_update_positive_embeds = true;
-  if (m_prev_inputs.negative_prompt.value != in_config.negative_prompt.value || !m_negative_embeddings)
-    need_update_negative_embeds = true;
-  if (m_prev_inputs.seed.value != in_config.seed.value)
-    need_reseed = true;
-  if (m_prev_inputs.guidance.value != in_config.guidance.value)
-    need_update_guidance = true;
-  if (m_prev_inputs.delta.value != in_config.delta.value)
-    need_update_delta= true;
-  // Runtime LoRA is gated on m_config_state (the last value actually pushed), not on
-  // m_prev_inputs, because the engine may not expose a lora_scale input at all.
-  if (m_sd.num_runtime_loras && m_sd.set_lora_scale
-      && in_config.lora_scale != m_config_state.lora_scale)
-    need_update_lora = true;
-
-  if (need_rebuild)
-  {
-    // Don't delete the pipeline - createConfiguration will reinit it
-    // This preserves the expensive TensorRT engines
-    m_embeddings.clear();
-    m_negative_embeddings.reset();
-    need_update_scheduler = true;
-    need_update_positive_embeds = true;
-    need_update_negative_embeds = true;
-    need_reseed = true;
-    need_update_guidance = false;
-    need_update_delta = false;
-  }
-
-  if (in_config.prompt.value.empty())
-    return;
-
-  // If a background SD producer is running, any main-thread mutation of the TRT context below
-  // (rebuild / scheduler / embeds / reseed / guidance / delta) would race it. Drain+join first; the
-  // async render path restarts it lazily once the context is stable again. Change-gated -> only fires
-  // on an actual config change, so a steady stream never stalls here. (Bump the generation so any
-  // in-flight job/frame from the old config is dropped by the consumer.)
-  if (m_sd_producer && m_sd_producer->running()
-      && (need_rebuild || need_update_scheduler || need_update_positive_embeds
-          || need_update_negative_embeds || need_reseed || need_update_guidance
-          || need_update_delta || need_update_lora))
-  {
-    stopSDProducer();
-    ++m_sd_gen;
-  }
-
-  // Create or reinit pipeline if needed
-  if (need_rebuild || !m_cached_engine || !m_cached_engine->pipeline)
-  {
-    if (!createConfiguration(in_config, *new_t1))
+    releaseFamily();
+    m_family = family;
+    if(in.gpu.value != m_device)
     {
-      noteSetupFailure(in_config);
-      return;
-    }
-  }
-
-  if (!m_cached_engine || !m_cached_engine->pipeline)
-    return;
-
-  // Recomputed here so every downstream buffer allocation and library call uses the CLAMPED value.
-  int model_tex_w = 0, model_tex_h = 0;
-  if (!resolveResolution(in_config, model_tex_w, model_tex_h))
-    return;
-
-  unsigned char* input_tex_bytes{inputs.image.texture.bytes};
-  m_cur_input = {};
-
-  // Create output texture
-  switch (this->inputs.workflow)
-  {
-    case Workflow::FLUX2_KLEIN_TXT2IMG:
-    case Workflow::FLUX2_KLEIN_IMG2IMG:
-    case Workflow::FLUX2_KLEIN_INPAINT:
-      // Handled by runKlein() above; never reached here.
-      return;
-    case Workflow::SD_TXT2IMG:
-    case Workflow::SD_TXT2IMG_CONTROLNET:
-    case Workflow::SDXL_TXT2IMG_CONTROLNET:
-    case Workflow::SD_TXT2IMG_IPADAPTER:
-    case Workflow::SDTURBO_TXT2IMG:
-    case Workflow::SDXL_TXT2IMG:
-    case Workflow::V2V_TXT2IMG:
-      this->outputs.image.create(model_tex_w, model_tex_h);
-      break;
-    case Workflow::SD_IMG2IMG:
-    case Workflow::SD_IMG2IMG_CONTROLNET:
-    case Workflow::SDXL_IMG2IMG_CONTROLNET:
-    case Workflow::SD_IMG2IMG_IPADAPTER:
-    case Workflow::SDTURBO_IMG2IMG:
-    case Workflow::SDXL_IMG2IMG:
-    case Workflow::V2V_IMG2IMG:
-    {
-      // An unconnected "In" port (or an early / short readback) delivers the render-target's width
-      // and height while `bytes` is still null: score does this routinely.
-      if(inputs.image.texture.width <= 0)
-        return;
-      if(inputs.image.texture.height <= 0)
-        return;
-      if(!inputs.image.texture.bytes)
-        return;
-      const lo::image_size model_sz{model_tex_w, model_tex_h};
-
-      m_cur_input = lo::rgba_image(
-          inputs.image.texture.bytes, inputs.image.texture.width,
-          inputs.image.texture.height);
-
-      if(model_tex_w != inputs.image.texture.width
-         || model_tex_h != inputs.image.texture.height)
+      // The cached SD engine is bound to the old device; hand it back and let configureSD acquire
+      // or build one for the new device.
+      m_device = in.gpu.value;
+      if(m_cached_engine)
       {
-        m_cur_input = m_cur_input.scaled(model_sz);
+        EngineCache::instance().release(m_cached_engine);
+        m_cached_engine = nullptr;
       }
-
-      blendTextures();
-
-      // Feed the BLENDED buffer to the library: blendTextures() writes into m_cur_input, which is
-      // also guaranteed to be exactly model_tex_w * model_tex_h * 4 bytes (the raw port is not).
-      input_tex_bytes = m_cur_input.bits();
-
-      this->outputs.image.create(model_tex_w, model_tex_h);
-      break;
     }
   }
 
-  // Update scheduler if timesteps changed
-  if (need_update_scheduler)
+  if(in.model.value.empty())
+    return;
+  if(setupBlocked(in))
+    return;
+  if(!configure(in))
   {
-    if (!updateScheduler(in_config.t1.value))
-    {
-      noteSetupFailure(in_config);
-      return;
-    }
+    noteSetupFailure(in);
+    return;
   }
-
-  // Update embeddings if prompt changed
-  if (need_update_positive_embeds)
-  {
-    bool ok = updatePromptEmbeddings(in_config.prompt.value, m_embeddings);
-    if(!ok) {
-      std::fprintf(stderr, "Invalid prompt\n");
-      noteSetupFailure(in_config);
-      return;
-    }
-  }
-
-  if (need_update_negative_embeds)
-  {
-    bool ok = updatePromptEmbedding(in_config.negative_prompt.value, m_negative_embeddings);
-    if(!ok) {
-      std::fprintf(stderr, "Invalid negative prompt\n");
-      noteSetupFailure(in_config);
-      return;
-    }
-    if (m_sd.prepare_negative_embeds(
-            m_cached_engine->pipeline->get(), m_negative_embeddings.embeddings,
-            m_config_state.text_seq_len, m_config_state.text_hidden_dim)
-        != LIBREDIFFUSION_SUCCESS)
-    {
-      std::fprintf(stderr, "StreamDiffusion: prepare_negative_embeds failed\n");
-      noteSetupFailure(in_config);
-      return;
-    }
-  }
-
-  // Setup (engine + scheduler + embeddings) is complete for this input set: clear the back-off so
-  // a later, genuinely different failure is diagnosed on its own terms.
   noteSetupSuccess();
 
-  // Handle seed change
-  if (need_reseed)
+  renderTick(in, triggered);
+  m_prev_inputs = inputs;
+}
+
+bool StreamDiffusion::configure(const inputs_t& in)
+{
+  switch(m_family)
   {
-    m_sd.reseed(m_cached_engine->pipeline->get(), in_config.seed.value);
+    case Family::SD:
+      return configureSD(in);
+    case Family::Klein:
+      return configureKlein(in);
+    case Family::Turbo:
+      return configureTurbo(in);
   }
-  if (need_update_guidance)
+  return false;
+}
+
+void StreamDiffusion::builderTick(const inputs_t& in, bool build_requested)
+{
+  auto& builder = ModelBuilder::instance();
+  if(build_requested)
   {
-    m_config_state.guidance_scale = in_config.guidance.value;
-    m_sd.set_guidance_scale(m_cached_engine->pipeline->get(), in_config.guidance.value);
-  }
-  if (need_update_delta)
-  {
-    m_config_state.delta = in_config.delta.value;
-    m_sd.set_delta(m_cached_engine->pipeline->get(), in_config.delta.value);
+    BuildRequest request;
+    request.python_cache = in.python_cache.value;
+    request.build_folder
+        = in.build_folder.value.empty() ? in.model.value : in.build_folder.value;
+    request.options = in.build_options.value;
+    request.gpu = in.gpu.value;
+    std::string error;
+    if(!builder.start(std::move(request), error))
+      std::fprintf(stderr, "StreamDiffusion: build not started: %s\n", error.c_str());
   }
 
-  // ControlNet: feed this frame's control map (the "Control / Style" texture),
-  // preprocessed externally (canny/depth/pose/...). The C-API uploads the host
-  // RGBA->RGB NCHW [0,1] fp16 on-device and tiles it to the UNet batch. Resize to
-  // the model resolution first (the controlnet engine expects [1,3,H,W] at H/W).
-  if(is_controlnet_workflow(in_config.workflow.value)
-     && m_config_state.controlnet_index >= 0 && m_sd.set_controlnet_cond_rgba)
+  const BuildStatus status = builder.status();
+  std::string text = build_state_name(status.state);
+  if(!status.message.empty())
+    text += ": " + status.message;
+  if(text != m_build_status)
   {
-    // Live-adjust the conditioning scale.
-    if(m_sd.set_controlnet_scale
-       && in_config.controlnet_scale != m_config_state.controlnet_scale)
+    m_build_status = text;
+    outputs.build_status.value = text;
+    std::fprintf(stderr, "StreamDiffusion: build %s\n", text.c_str());
+    // A finished build may be exactly the bundle a blocked setup was waiting for.
+    if(status.state == BuildState::Done)
+      noteSetupSuccess();
+  }
+}
+
+// The frame's inputs, at model resolution. False when nothing can be rendered this tick.
+bool StreamDiffusion::buildJob(const inputs_t& in, AsyncJob& job)
+{
+  const Workflow wf = in.workflow.value;
+  job.w = m_w;
+  job.h = m_h;
+  job.exp = std::clamp(in.rife_exp.value, 0, 3);
+  job.gen = m_gen;
+  const size_t nbytes = (size_t)m_w * m_h * 4;
+
+  if(isImg2Img(wf))
+  {
+    // An unconnected "In" port delivers a width and height while `bytes` is still null.
+    const auto& t = in.image.texture;
+    if(t.width <= 0 || t.height <= 0 || !t.bytes)
+      return false;
+    m_cur_input = rgba_image(t.bytes, t.width, t.height);
+    if(t.width != m_w || t.height != m_h)
+      m_cur_input = m_cur_input.scaled({m_w, m_h});
+    blendFeedback(m_cur_input, in);
+    job.ref_rgba = m_cur_input.px;
+  }
+  else if(m_family == Family::Klein)
+  {
+    job.ref_rgba.assign(nbytes, 0);  // txt2img: a neutral reference, encoded once
+  }
+  job.ref_hash = hash_bytes(job.ref_rgba.data(), job.ref_rgba.size());
+
+  if(isControlNet(wf) || isIPAdapter(wf))
+  {
+    const auto& c = in.control.texture;
+    if(c.bytes && c.width > 0 && c.height > 0)
     {
-      m_config_state.controlnet_scale = in_config.controlnet_scale;
-      m_sd.set_controlnet_scale(
-          m_cached_engine->pipeline->get(), m_config_state.controlnet_index,
-          m_config_state.controlnet_scale);
+      // The ControlNet engine expects the model geometry; the IP-Adapter image encoder resizes itself.
+      rgba_image ctl(c.bytes, c.width, c.height);
+      if(isControlNet(wf) && (c.width != m_w || c.height != m_h))
+        ctl = ctl.scaled({m_w, m_h});
+      job.control_w = ctl.w;
+      job.control_h = ctl.h;
+      job.control_rgba = std::move(ctl.px);
+      job.control_hash = hash_bytes(job.control_rgba.data(), job.control_rgba.size());
+      m_reported_no_control = false;
     }
-
-    const auto& ctl = in_config.control.texture;
-    if(ctl.bytes && ctl.width > 0 && ctl.height > 0)
+    else if(isControlNet(wf))
     {
-      lo::rgba_image ctl_img(ctl.bytes, ctl.width, ctl.height);
-      if(ctl.width != model_tex_w || ctl.height != model_tex_h)
-        ctl_img = ctl_img.scaled({model_tex_w, model_tex_h});
+      // The ControlNet engine would run on stale or zero conditioning: skip the frame. (An
+      // IP-Adapter style is static and may stay applied; renderSD decides.)
+      if(!m_reported_no_control)
+      {
+        m_reported_no_control = true;
+        std::fprintf(
+            stderr, "StreamDiffusion: ControlNet workflow but no image on the 'Control / Style' input\n");
+      }
+      return false;
+    }
+  }
 
+  job.controlnet_scale = in.controlnet_scale.value;
+  job.ipadapter_scale = in.ipadapter_scale.value;
+  job.guidance = in.guidance.value;
+  job.delta = in.delta.value;
+  job.lora_scale = in.lora_scale.value;
+  job.seed = in.seed.value;
+  if(m_family == Family::Turbo)
+    job.ehs = in.ehs.value;
+
+  struct
+  {
+    uint64_t ref, control, ehs;
+    float cn_scale, ip_scale, guidance, delta, lora;
+    int seed, w, h, exp;
+  } key{job.ref_hash,         job.control_hash,
+        hash_bytes(job.ehs.data(), job.ehs.size() * sizeof(float)),
+        job.controlnet_scale, job.ipadapter_scale, job.guidance, job.delta, job.lora_scale,
+        job.seed,             job.w,               job.h,        job.exp};
+  job.key = hash_bytes(&key, sizeof key);
+  return true;
+}
+
+// Feed prev. input / output: blend the previous input and/or output frame into this one.
+void StreamDiffusion::blendFeedback(rgba_image& cur, const inputs_t& in)
+{
+  const int a = std::clamp(int(in.feed_prev_in.value * 256.f), 0, 256);
+  const int b = std::clamp(int(in.feed_prev_out.value * 256.f), 0, 256 - a);
+  const bool use_in = a > 0 && m_prev_input.size() == cur.size();
+  const bool use_out = b > 0 && m_prev_output.size() == cur.size();
+  if(!use_in && !use_out)
+    return;
+  const int wa = use_in ? a : 0;
+  const int wb = use_out ? b : 0;
+  const int wc = 256 - wa - wb;
+  const uint8_t* pin = m_prev_input.constBits();
+  const uint8_t* pout = m_prev_output.constBits();
+  uint8_t* px = cur.bits();
+  const size_t n = cur.sizeInBytes();
+  for(size_t i = 0; i < n; i += 4)
+    for(int c = 0; c < 3; ++c)
+      px[i + c] = (wc * px[i + c] + wa * (use_in ? pin[i + c] : 0) + wb * (use_out ? pout[i + c] : 0)
+                   + 128)
+                  >> 8;
+}
+
+void StreamDiffusion::renderTick(const inputs_t& in, bool triggered)
+{
+  const double tnow = now_s_steady();
+  // Capped so a stall (engine load, blocked host) does not burst-drain the FIFO afterwards.
+  const double dt = std::clamp(m_last_tick_t > 0.0 ? tnow - m_last_tick_t : 0.0, 0.0, 0.1);
+  m_last_tick_t = tnow;
+
+  AsyncJob job;
+  const bool have_job = buildJob(in, job);
+  const bool manual = in.manual.value;
+  const bool fire = triggered;
+  const int budget_sweeps = in.pacing.value == Smooth ? 3 : in.pacing.value == Fresh ? 2 : 1;
+
+  auto adopt = [&](const AsyncFrame& frame) {
+    m_consumer.on_keyframe(frame, tnow, budget_sweeps, m_gen);
+    if(frame.gen != m_gen)
+      return;
+    if(in.feed_prev_in.value > 0)
+      m_prev_input = m_cur_input;
+    if(in.feed_prev_out.value > 0)
+      m_prev_output = rgba_image(frame.rgba.data(), frame.w, frame.h);
+  };
+
+  const unsigned char* out = nullptr;
+  size_t out_bytes = 0;
+  bool have_frame = false;
+  if(in.async_mode.value)
+  {
+    ensureProducer(m_continuous && !manual);
+    if(have_job && (manual ? fire : job.key != m_submitted_key))
+    {
+      m_submitted_key = job.key;
+      m_producer->submit(std::move(job));
+    }
+    AsyncFrame fresh;
+    if(m_producer->consume(fresh))
+      adopt(fresh);
+    have_frame = m_consumer.present(dt, out, out_bytes);
+  }
+  else
+  {
+    if(m_producer && m_producer->running())
+      stopProducer();
+    // Render when the FIFO ran dry (every tick without interpolation, every 2^exp ticks with it).
+    if(have_job && (manual ? fire : m_consumer.empty()))
+    {
+      AsyncFrame frame;
+      if(produceFrame(job, frame))
+        adopt(frame);
+    }
+    have_frame = m_consumer.present_next(out, out_bytes);
+  }
+
+  // Publish only a NEW frame: a failed render or a held frame leaves the host's texture alone.
+  const bool publish = have_frame && m_consumer.advanced();
+  if(publish)
+  {
+    const size_t nbytes = (size_t)m_w * m_h * 4;
+    outputs.image.create(m_w, m_h);
+    std::memcpy(outputs.image.texture.bytes, out, std::min(nbytes, out_bytes));
+  }
+  outputs.image.texture.changed = publish;
+}
+
+void StreamDiffusion::ensureProducer(bool continuous)
+{
+  if(!m_producer)
+    m_producer = std::make_unique<AsyncFrameProducer<AsyncJob, AsyncFrame>>(
+        [this](AsyncJob& job, AsyncFrame& out) { return produceFrame(job, out); });
+  if(m_producer->running() && m_producer->continuous() != continuous)
+    stopProducer();
+  if(!m_producer->running())
+    m_producer->start(continuous);
+}
+
+// Drain + join the producer and forget every frame of the current configuration. After this the
+// render thread owns the pipelines again.
+void StreamDiffusion::stopProducer()
+{
+  if(m_producer)
+    m_producer->stop();
+  ++m_gen;
+  m_consumer.reset();
+  m_prev_key.clear();
+  m_applied_ref_hash = 0;
+  m_applied_control_hash = 0;
+  m_reported_no_style = false;
+  m_submitted_key = 0;
+  m_last_tick_t = 0.0;
+}
+
+void StreamDiffusion::releaseFamily()
+{
+  stopProducer();
+  m_rife.reset();
+  m_rife_tried = false;
+  m_model_dir.clear();
+  m_w = m_h = 0;
+
+  m_klein_stream.reset();
+  m_klein_quality = -1;
+  m_klein_seed = 0;
+  m_klein_prompt.clear();
+  m_klein_sched.clear();
+  m_klein_mask_hash = 0;
+
+  m_i2it.reset();
+  m_i2it_clip.reset();
+  m_i2it_embeddings.reset();
+  m_i2it_prompt.clear();
+}
+
+// -------------------------------------------------------------------------------------------------
+// Rendering (producer thread when Async is on, render thread otherwise)
+// -------------------------------------------------------------------------------------------------
+bool StreamDiffusion::produceFrame(AsyncJob& job, AsyncFrame& out)
+{
+  const size_t nbytes = (size_t)job.w * job.h * 4;
+  if(nbytes == 0)
+    return false;
+  out.w = job.w;
+  out.h = job.h;
+  out.gen = job.gen;
+  out.rgba.assign(nbytes, 0);
+  if(!renderFrame(job, out.rgba.data()))
+    return false;
+  if(job.exp > 0 && m_prev_key.size() == nbytes)
+    interpolate(job, out);
+  m_prev_key = out.rgba;
+  return true;
+}
+
+bool StreamDiffusion::renderFrame(const AsyncJob& job, unsigned char* out_rgba)
+{
+  switch(m_family)
+  {
+    case Family::SD:
+      return renderSD(job, out_rgba);
+    case Family::Klein:
+      return renderKlein(job, out_rgba);
+    case Family::Turbo:
+      return renderTurbo(job, out_rgba);
+  }
+  return false;
+}
+
+bool StreamDiffusion::renderSD(const AsyncJob& job, unsigned char* out_rgba)
+{
+  if(!m_cached_engine || !m_cached_engine->pipeline)
+    return false;
+  auto pipe = m_cached_engine->pipeline->get();
+  SDConfigState& s = m_config_state;
+
+  if(s.controlnet_index >= 0)
+  {
+    if(job.control_hash != m_applied_control_hash)
+    {
       m_sd.set_controlnet_cond_rgba(
-          m_cached_engine->pipeline->get(), m_config_state.controlnet_index,
-          ctl_img.constBits(), model_tex_h, model_tex_w);
+          pipe, s.controlnet_index, job.control_rgba.data(), job.control_h, job.control_w);
+      m_applied_control_hash = job.control_hash;
+    }
+    if(job.controlnet_scale != s.controlnet_scale)
+    {
+      s.controlnet_scale = job.controlnet_scale;
+      m_sd.set_controlnet_scale(pipe, s.controlnet_index, job.controlnet_scale);
+    }
+  }
+  if(s.ipadapter_enabled)
+  {
+    // The style is static: re-encode only when the image changes, keep it when it is unplugged.
+    if(!job.control_rgba.empty() && job.control_hash != m_applied_control_hash)
+    {
+      m_sd.set_ipadapter_image(pipe, job.control_rgba.data(), job.control_h, job.control_w);
+      m_applied_control_hash = job.control_hash;
+    }
+    if(m_applied_control_hash == 0)
+    {
+      // An IP-variant UNet with no tokens at all: skip rather than run on nothing.
+      if(!m_reported_no_style)
+      {
+        m_reported_no_style = true;
+        std::fprintf(
+            stderr, "StreamDiffusion: IP-Adapter workflow but no style image on the 'Control / Style' input\n");
+      }
+      return false;
+    }
+    if(job.ipadapter_scale != s.ipadapter_scale)
+    {
+      s.ipadapter_scale = job.ipadapter_scale;
+      m_sd.set_ipadapter_scale(pipe, job.ipadapter_scale);
+    }
+  }
+
+  // The cheap live parameters: pushed from here so an automated knob never stops the producer.
+  if(!s.seeded || job.seed != s.seed)
+  {
+    m_sd.reseed(pipe, job.seed);
+    s.seed = job.seed;
+    s.seeded = true;
+  }
+  if(job.guidance != s.guidance_scale)
+  {
+    s.guidance_scale = job.guidance;
+    m_sd.set_guidance_scale(pipe, job.guidance);
+  }
+  if(job.delta != s.delta)
+  {
+    s.delta = job.delta;
+    m_sd.set_delta(pipe, job.delta);
+  }
+  if(job.lora_scale != s.lora_scale)
+  {
+    // Uniform across the runtime-LoRA slots; a no-op for engines without a lora_scale input.
+    const int slots = m_sd.num_runtime_loras(pipe);
+    for(int i = 0; i < slots; ++i)
+      m_sd.set_lora_scale(pipe, i, job.lora_scale);
+    s.lora_scale = job.lora_scale;
+  }
+
+  const auto err = job.ref_rgba.empty()
+                       ? m_sd.txt2img(pipe, out_rgba, job.w, job.h)
+                       : m_sd.img2img(pipe, job.ref_rgba.data(), out_rgba, job.w, job.h);
+  if(err != LIBREDIFFUSION_SUCCESS)
+    std::fprintf(
+        stderr, "StreamDiffusion: %s failed (%d)\n", job.ref_rgba.empty() ? "txt2img" : "img2img",
+        (int)err);
+  return err == LIBREDIFFUSION_SUCCESS;
+}
+
+bool StreamDiffusion::renderKlein(const AsyncJob& job, unsigned char* out_rgba)
+{
+  if(!m_klein_stream)
+    return false;
+  // VAE-encode the reference only when it changed (txt2img's black reference: once).
+  if(job.ref_hash != m_applied_ref_hash)
+  {
+    if(m_sd.flux2_stream_set_reference(m_klein_stream.get(), job.ref_rgba.data())
+       != LIBREDIFFUSION_SUCCESS)
+    {
+      std::fprintf(stderr, "FLUX.2-klein: set_reference failed\n");
+      return false;
+    }
+    m_applied_ref_hash = job.ref_hash;
+  }
+  const auto err = m_sd.flux2_stream_frame_cached(m_klein_stream.get(), out_rgba);
+  if(err != LIBREDIFFUSION_SUCCESS)
+    std::fprintf(stderr, "FLUX.2-klein: frame failed (%d)\n", (int)err);
+  return err == LIBREDIFFUSION_SUCCESS;
+}
+
+bool StreamDiffusion::renderTurbo(const AsyncJob& job, unsigned char* out_rgba)
+{
+  if(!m_i2it)
+    return false;
+  const size_t frame_bytes = (size_t)m_sd.img2img_turbo_frame_bytes(m_i2it.get());
+  const size_t ehs_elems = (size_t)m_sd.img2img_turbo_ehs_elements(m_i2it.get());
+  if(job.ref_rgba.size() < frame_bytes)
+    return false;
+
+  // The "Embedding" port overrides; otherwise the prompt's CLIP embedding on the device.
+  librediffusion_error_t err;
+  if(job.ehs.size() >= ehs_elems)
+    err = m_sd.img2img_turbo_frame_sized(
+        m_i2it.get(), job.ref_rgba.data(), job.ref_rgba.size(), job.ehs.data(), job.ehs.size(),
+        out_rgba, frame_bytes);
+  else if(m_i2it_embeddings)
+    err = m_sd.img2img_turbo_frame_dev_sized(
+        m_i2it.get(), job.ref_rgba.data(), job.ref_rgba.size(), m_i2it_embeddings.embeddings,
+        out_rgba, frame_bytes);
+  else
+    return false;  // nothing to translate without a text embedding
+  if(err != LIBREDIFFUSION_SUCCESS)
+    std::fprintf(stderr, "img2img-turbo: frame failed (%d)\n", (int)err);
+  return err == LIBREDIFFUSION_SUCCESS;
+}
+
+// RIFE the sweep prev -> cur into out.sweep. The engine is loaded once per model/device; a bundle
+// without one (or an engine that cannot run this geometry) leaves the keyframe alone.
+void StreamDiffusion::interpolate(const AsyncJob& job, AsyncFrame& out)
+{
+  if(!m_rife && !m_rife_tried)
+  {
+    m_rife_tried = true;
+    const std::string path = rife_engine_path(m_model_dir);
+    if(!path.empty())
+      m_rife = SDRife{path.c_str(), m_device};
+    if(m_rife)
+      m_sd.rife_set_enabled(m_rife.get(), 1);
+    else
+      std::fprintf(
+          stderr, "StreamDiffusion: no usable rife_ifnet_fp16.plan for %s; interpolation off\n",
+          m_model_dir.c_str());
+  }
+  if(!m_rife)
+    return;
+
+  m_sd.rife_set_interpolation_exp(m_rife.get(), job.exp);
+  const size_t needed = m_sd.rife_required_out_bytes(m_rife.get(), job.h, job.w);
+  out.sweep.assign(needed, 0);
+  int n = 0;
+  if(m_sd.rife_interpolate_sized(
+         m_rife.get(), m_prev_key.data(), out.rgba.data(), job.h, job.w, out.sweep.data(),
+         out.sweep.size(), &n)
+         == LIBREDIFFUSION_SUCCESS
+     && n > 0)
+  {
+    out.sweep_n = n;
+  }
+  else
+  {
+    out.sweep.clear();
+    out.sweep_n = 0;
+  }
+}
+
+// -------------------------------------------------------------------------------------------------
+// SD family configuration
+// -------------------------------------------------------------------------------------------------
+bool StreamDiffusion::configureSD(const inputs_t& in)
+{
+  const auto new_t1 = get_steps(in.t1.value);
+  if(!new_t1 || new_t1->empty())
+  {
+    std::fprintf(
+        stderr, "StreamDiffusion: Timesteps \"%s\" %s\n", in.t1.value.c_str(),
+        new_t1 ? "contains no step" : "could not be parsed");
+    return false;
+  }
+  if(in.prompt.value.empty())
+    return false;
+
+  const inputs_t& prev = m_prev_inputs;
+  const auto prev_t1 = get_steps(prev.t1.value);
+  const std::size_t n_prev_t1 = prev_t1 ? prev_t1->size() : 0;
+
+  // State-based, not only input-based: a failed switch to another family (nothing is recorded in
+  // m_prev_inputs on failure) must not leave a pipeline without geometry.
+  const bool need_rebuild
+      = !m_cached_engine || !m_cached_engine->pipeline || m_w == 0
+        || m_model_dir != in.model.value || n_prev_t1 != new_t1->size()
+        || prev.add_noise.value != in.add_noise.value
+        || prev.denoise_batch.value != in.denoise_batch.value
+        || prev.workflow.value != in.workflow.value
+        || prev.size.value.x != in.size.value.x || prev.size.value.y != in.size.value.y
+        || prev.cfg.value != in.cfg.value
+        || std::signbit(prev.guidance.value - 1.f) != std::signbit(in.guidance.value - 1.f);
+  const bool need_scheduler = need_rebuild || prev.t1.value != in.t1.value;
+  const bool need_positive
+      = need_rebuild || prev.prompt.value != in.prompt.value || m_embeddings.empty();
+  const bool need_negative = need_rebuild || prev.negative_prompt.value != in.negative_prompt.value
+                             || !m_negative_embeddings;
+
+  // Every step below mutates the pipeline the producer may be driving. (Seed, guidance, delta and
+  // LoRA scale travel in the job and are applied by the producer itself.)
+  if(need_rebuild || need_scheduler || need_positive || need_negative)
+    stopProducer();
+
+  if(need_rebuild && !createSDPipeline(in, *new_t1))
+    return false;
+  auto pipe = m_cached_engine->pipeline->get();
+
+  if(need_scheduler && !updateScheduler(in.t1.value))
+    return false;
+  if(need_positive && !updatePromptEmbeddings(in.prompt.value, m_embeddings))
+  {
+    std::fprintf(stderr, "StreamDiffusion: invalid prompt\n");
+    return false;
+  }
+  if(need_negative)
+  {
+    if(!updatePromptEmbedding(in.negative_prompt.value, m_negative_embeddings)
+       || m_sd.prepare_negative_embeds(
+              pipe, m_negative_embeddings.embeddings, m_config_state.text_seq_len,
+              m_config_state.text_hidden_dim)
+              != LIBREDIFFUSION_SUCCESS)
+    {
+      std::fprintf(stderr, "StreamDiffusion: invalid negative prompt\n");
+      return false;
+    }
+  }
+  return true;
+}
+
+bool StreamDiffusion::createSDPipeline(const inputs_t& in, std::vector<int> timestep_indices)
+{
+  int width = 0, height = 0;
+  if(!resolveResolution(in, 8, width, height))
+    return false;
+
+  librediffusion_model_type_t model_type = MODEL_SD_15;
+  librediffusion_pipeline_mode_t pipeline_mode = MODE_SINGLE_FRAME;
+  switch(in.workflow.value)
+  {
+    case SDTURBO_TXT2IMG:
+    case SDTURBO_IMG2IMG:
+      model_type = MODEL_SD_TURBO;
+      break;
+    case SDXL_TXT2IMG:
+    case SDXL_IMG2IMG:
+    case SDXL_TXT2IMG_CONTROLNET:
+    case SDXL_IMG2IMG_CONTROLNET:
+      model_type = MODEL_SDXL_TURBO;
+      break;
+    case V2V_TXT2IMG:
+    case V2V_IMG2IMG:
+      pipeline_mode = MODE_TEMPORAL_V2V;
+      break;
+    default:
+      break;
+  }
+
+  const std::string& model = in.model.value;
+  if(m_cached_engine
+     && (m_cached_engine->model_path != model || m_cached_engine->pipeline_mode != pipeline_mode))
+  {
+    EngineCache::instance().release(m_cached_engine);
+    m_cached_engine = nullptr;
+  }
+  if(!m_cached_engine)
+  {
+    m_cached_engine = EngineCache::instance().acquire(model, pipeline_mode, m_device);
+    if(!m_cached_engine)
+    {
+      auto engine = std::make_unique<CachedEngine>();
+      engine->model_path = model;
+      engine->pipeline_mode = pipeline_mode;
+      engine->device = m_device;
+      engine->clip1 = new SDClip{(model + "/clip.engine").c_str(), m_device};
+      if(!*engine->clip1)
+        return false;
+      m_cached_engine = EngineCache::instance().store(std::move(engine));
+    }
+  }
+  // SD / SDXL / ControlNet / IP-Adapter share MODE_SINGLE_FRAME, so an entry created by an SD
+  // workflow lacks the clip2 an SDXL workflow needs; build it on demand.
+  if(model_type == MODEL_SDXL_TURBO && !m_cached_engine->clip2)
+  {
+    auto* clip2 = new SDClip{(model + "/clip2.engine").c_str(), m_device};
+    if(!*clip2)
+    {
+      std::fprintf(stderr, "StreamDiffusion: SDXL workflow but %s/clip2.engine could not be loaded\n",
+                   model.c_str());
+      delete clip2;
+      return false;
+    }
+    m_cached_engine->clip2 = clip2;
+  }
+
+  SDConfigState& s = m_config_state;
+  s.model_type = model_type;
+  s.pipeline_mode = pipeline_mode;
+  s.width = width;
+  s.height = height;
+  s.batch_size = 1;
+  s.timestep_indices = std::move(timestep_indices);
+  s.denoising_steps = (int)s.timestep_indices.size();
+  s.controlnet_index = -1;
+  s.controlnet_scale = in.controlnet_scale.value;
+  s.ipadapter_enabled = isIPAdapter(in.workflow.value);
+  s.ipadapter_scale = in.ipadapter_scale.value;
+  s.lora_scale = -1.f;  // pushed again by the first frame: a new engine may have LoRA slots
+  s.seeded = false;
+  s.do_add_noise = in.add_noise.value;
+  s.delta = in.delta.value;
+  s.text_seq_len = 77;
+  s.pooled_embedding_dim = 1280;
+  switch(model_type)
+  {
+    case MODEL_SD_TURBO:  // genuinely single-step
+      s.use_denoising_batch = false;
+      s.denoising_steps = 1;
+      s.cfg_type = SD_CFG_NONE;
+      s.guidance_scale = 0.0f;
+      s.text_hidden_dim = 1024;
+      s.clip_pad_token = 0;
+      break;
+    case MODEL_SDXL_TURBO:
+      // The whole SDXL family (Hyper-SDXL / Lightning / LCM-LoRA / VegaRT are multi-step); the
+      // engine's batch profile constrains the step count.
+      s.use_denoising_batch = in.denoise_batch.value;
+      s.cfg_type = SD_CFG_NONE;
+      s.guidance_scale = 0.0f;
+      s.text_hidden_dim = 2048;
+      s.clip_pad_token = 0;
+      break;
+    default:
+      s.use_denoising_batch = in.denoise_batch.value;
+      switch(in.cfg.value)
+      {
+        case None:
+          s.cfg_type = SD_CFG_NONE;
+          break;
+        case Full:
+          s.cfg_type = SD_CFG_FULL;
+          break;
+        case Self:
+          s.cfg_type = SD_CFG_SELF;
+          break;
+        case Initialize:
+          s.cfg_type = SD_CFG_INITIALIZE;
+          break;
+      }
+      s.guidance_scale = in.guidance.value;
+      s.text_hidden_dim = 768;
+      s.clip_pad_token = 49407;
+      // SD2.1 shares this path but encodes to 1024: take the manifest's width when it declares one.
+      if(const int dim = bundle_embedding_dim(model); dim > 0)
+        s.text_hidden_dim = dim;
+      break;
+  }
+
+  SDConfig config;
+  if(!config)
+    return false;
+  // The validating setters keep the previous value on rejection while everything downstream
+  // reports success, so the pipeline would run at a geometry nobody asked for. Refuse instead.
+  auto accepted = [](librediffusion_error_t err, const char* what) {
+    if(err == LIBREDIFFUSION_SUCCESS)
+      return true;
+    std::fprintf(stderr, "StreamDiffusion: %s rejected the request (%d)\n", what, (int)err);
+    return false;
+  };
+  m_sd.config_set_device(config.get(), m_device);
+  m_sd.config_set_model_type(config.get(), model_type);
+  m_sd.config_set_pipeline_mode(config.get(), pipeline_mode);
+  if(!accepted(
+         m_sd.config_set_dimensions(config.get(), width, height, width / 8, height / 8),
+         "config_set_dimensions"))
+    return false;
+  if(!accepted(m_sd.config_set_batch_size(config.get(), s.batch_size), "config_set_batch_size"))
+    return false;
+  if(!accepted(
+         m_sd.config_set_denoising_steps(config.get(), s.denoising_steps),
+         "config_set_denoising_steps"))
+    return false;
+  m_sd.config_set_guidance_scale(config.get(), s.guidance_scale);
+  m_sd.config_set_delta(config.get(), s.delta);
+  m_sd.config_set_add_noise(config.get(), s.do_add_noise ? 1 : 0);
+  m_sd.config_set_denoising_batch(config.get(), s.use_denoising_batch ? 1 : 0);
+  m_sd.config_set_cfg_type(config.get(), static_cast<librediffusion_cfg_type_t>(s.cfg_type));
+  // CUDA graph: capturable only for one step, cfg-none, non-V2V (the library re-gates identically).
+  m_sd.config_set_cuda_graph(
+      config.get(),
+      (s.denoising_steps == 1 && s.cfg_type == SD_CFG_NONE && pipeline_mode != MODE_TEMPORAL_V2V)
+          ? 1
+          : 0);
+  if(!accepted(
+         m_sd.config_set_text_config(
+             config.get(), s.text_seq_len, s.text_hidden_dim, s.clip_pad_token),
+         "config_set_text_config"))
+    return false;
+  if(model_type == MODEL_SDXL_TURBO
+     && !accepted(
+         m_sd.config_set_sdxl_config(config.get(), s.pooled_embedding_dim, 6),
+         "config_set_sdxl_config"))
+    return false;
+
+  m_sd.config_set_unet_engine(config.get(), (model + "/unet.engine").c_str());
+  m_sd.config_set_vae_encoder(config.get(), (model + "/vae_encoder.engine").c_str());
+  m_sd.config_set_vae_decoder(config.get(), (model + "/vae_decoder.engine").c_str());
+
+  if(isControlNet(in.workflow.value))
+  {
+    const std::string controlnet = model + "/controlnet.engine";
+    s.controlnet_index
+        = m_sd.config_add_controlnet(config.get(), controlnet.c_str(), s.controlnet_scale);
+    if(s.controlnet_index < 0)
+    {
+      std::fprintf(
+          stderr, "StreamDiffusion: config_add_controlnet failed (missing %s?)\n",
+          controlnet.c_str());
+      return false;
+    }
+  }
+  if(s.ipadapter_enabled)
+  {
+    // SD1.5 base IP-Adapter: 4 tokens. The image encoder engines let the node turn the raw style
+    // texture into tokens on-device.
+    m_sd.config_set_ipadapter(config.get(), 4, s.ipadapter_scale);
+    m_sd.config_set_ipadapter_image_encoder(
+        config.get(), (model + "/clip_image_encoder.engine").c_str(),
+        (model + "/ip_image_proj.engine").c_str());
+  }
+  m_sd.config_set_timestep_indices(
+      config.get(), s.timestep_indices.data(), s.timestep_indices.size());
+
+  // StreamV2V: kvo_cache extended self-attention, banking the previous 2 frames (profile max 4).
+  // Feature injection / similarity are inert for the extended-attention engines.
+  if(pipeline_mode == MODE_TEMPORAL_V2V)
+    m_sd.config_set_temporal_params(config.get(), 1, in.add_noise.value ? 1 : 0, 0.8f, 0.78f, 1, 2);
+
+  // ControlNet / IP-Adapter engines are loaded only at pipeline creation, not at reinit_buffers, so
+  // entering or leaving such a workflow needs a fresh pipeline.
+  const bool feature_pipeline
+      = isControlNet(in.workflow.value) || isIPAdapter(in.workflow.value)
+        || isControlNet(m_prev_inputs.workflow.value) || isIPAdapter(m_prev_inputs.workflow.value);
+  if(feature_pipeline && m_cached_engine->pipeline)
+  {
+    delete m_cached_engine->pipeline;
+    m_cached_engine->pipeline = nullptr;
+  }
+  if(m_cached_engine->pipeline && *m_cached_engine->pipeline)
+  {
+    // The engines cannot be reloaded here, so a geometry outside their profiles is refused.
+    if(!accepted(
+           m_sd.pipeline_reinit_buffers(m_cached_engine->pipeline->get(), config.get()),
+           "pipeline_reinit_buffers"))
+      return false;
+  }
+  else
+  {
+    delete m_cached_engine->pipeline;
+    m_cached_engine->pipeline = new SDPipeline{config.get()};
+    if(!*m_cached_engine->pipeline)
+      return false;
+  }
+
+  m_model_dir = model;
+  m_w = width;
+  m_h = height;
+  m_continuous = s.use_denoising_batch || pipeline_mode == MODE_TEMPORAL_V2V;
+  m_rife.reset();
+  m_rife_tried = false;
+  m_embeddings.clear();
+  m_negative_embeddings.reset();
+  return true;
+}
+
+bool StreamDiffusion::updatePromptEmbedding(const std::string& prompt, SDXLEmbeddings& embeddings)
+{
+  // The CLIP calls overwrite the device pointers with a fresh allocation; release what is held.
+  embeddings.reset();
+  auto pipe = m_cached_engine->pipeline->get();
+  if(m_config_state.model_type == MODEL_SDXL_TURBO)
+  {
+    if(m_sd.clip_compute_embeddings_sdxl(
+           m_cached_engine->clip1->get(), m_cached_engine->clip2->get(), prompt.c_str(),
+           m_config_state.batch_size, m_config_state.height, m_config_state.width, nullptr,
+           &embeddings.embeddings, &embeddings.pooled_embeds, &embeddings.time_ids)
+       != LIBREDIFFUSION_SUCCESS)
+      return false;
+    return m_sd.prepare_sdxl_conditioning(pipe, embeddings.pooled_embeds, embeddings.time_ids)
+           == LIBREDIFFUSION_SUCCESS;
+  }
+  return m_sd.clip_compute_embeddings(
+             m_cached_engine->clip1->get(), prompt.c_str(), m_config_state.clip_pad_token,
+             nullptr, &embeddings.embeddings)
+         == LIBREDIFFUSION_SUCCESS;
+}
+
+bool StreamDiffusion::updatePromptEmbeddings(
+    const std::string& prompt, std::vector<SDXLEmbeddings>& embeddings)
+{
+  embeddings.clear();
+  auto pipe = m_cached_engine->pipeline->get();
+  if(auto weights = parse_input_string(prompt))
+  {
+    boost::container::small_vector<float, 8> bweight;
+    boost::container::small_vector<librediffusion_half_t*, 8> bembeds;
+    for(const auto& [text, weight] : *weights)
+    {
+      SDXLEmbeddings e;
+      // blend_embeds does not null-check: a null device pointer there kills the CUDA context.
+      if(!updatePromptEmbedding(text, e) || !e.embeddings)
+      {
+        embeddings.clear();
+        return false;
+      }
+      bembeds.push_back(e.embeddings);
+      embeddings.push_back(std::move(e));
+      bweight.push_back(weight);
+    }
+    if(bembeds.empty())
+      return false;
+    return m_sd.blend_embeds(
+               pipe, bembeds.data(), bweight.data(), bembeds.size(), m_config_state.text_seq_len,
+               m_config_state.text_hidden_dim)
+           == LIBREDIFFUSION_SUCCESS;
+  }
+
+  SDXLEmbeddings e;
+  if(!updatePromptEmbedding(prompt, e) || !e.embeddings)
+    return false;
+  embeddings.push_back(std::move(e));
+  return m_sd.prepare_embeds(
+             pipe, embeddings.front().embeddings, m_config_state.text_seq_len,
+             m_config_state.text_hidden_dim)
+         == LIBREDIFFUSION_SUCCESS;
+}
+
+bool StreamDiffusion::updateScheduler(const std::string& timestep_str)
+{
+  auto timestep_indices = get_steps(timestep_str);
+  if(!timestep_indices || timestep_indices->empty())
+    return false;
+  if(m_config_state.model_type == MODEL_SD_TURBO)  // genuinely single-step
+    timestep_indices->resize(1);
+  m_config_state.timestep_indices = std::move(*timestep_indices);
+  m_config_state.denoising_steps = (int)m_config_state.timestep_indices.size();
+
+  std::span<const int> table_timesteps;
+  std::span<const streamdiffusion::TimestepParams> table_params;
+  using namespace streamdiffusion;
+  switch(m_config_state.model_type)
+  {
+    case MODEL_SD_TURBO:
+      table_timesteps = SCHEDULER_STABILITYAI_SD_TURBO::TIMESTEP_VALUES;
+      table_params = SCHEDULER_STABILITYAI_SD_TURBO::TIMESTEP_PARAMS;
+      break;
+    case MODEL_SDXL_TURBO:
+      table_timesteps = SCHEDULER_STABILITYAI_SDXL_TURBO::TIMESTEP_VALUES;
+      table_params = SCHEDULER_STABILITYAI_SDXL_TURBO::TIMESTEP_PARAMS;
+      break;
+    default:
+      table_timesteps = SCHEDULER_SIMIANLUO_LCM_DREAMSHAPER_V7::TIMESTEP_VALUES;
+      table_params = SCHEDULER_SIMIANLUO_LCM_DREAMSHAPER_V7::TIMESTEP_PARAMS;
+      break;
+  }
+
+  std::vector<float> timesteps, alpha, beta, c_skip, c_out;
+  for(int idx : m_config_state.timestep_indices)
+  {
+    if(idx < 0 || idx >= std::ssize(table_params) || idx >= std::ssize(table_timesteps))
+      continue;
+    timesteps.push_back(static_cast<float>(table_timesteps[idx]));
+    alpha.push_back(table_params[idx].alpha_prod_t_sqrt);
+    beta.push_back(table_params[idx].beta_prod_t_sqrt);
+    c_skip.push_back(table_params[idx].c_skip);
+    c_out.push_back(table_params[idx].c_out);
+  }
+  if(timesteps.empty())
+    return false;
+
+  const auto err = m_sd.prepare_scheduler(
+      m_cached_engine->pipeline->get(), timesteps.data(), alpha.data(), beta.data(), c_skip.data(),
+      c_out.data(), timesteps.size());
+  if(err != LIBREDIFFUSION_SUCCESS)
+    std::fprintf(stderr, "StreamDiffusion: prepare_scheduler failed (%d)\n", (int)err);
+  return err == LIBREDIFFUSION_SUCCESS;
+}
+
+// -------------------------------------------------------------------------------------------------
+// FLUX.2-klein configuration
+// -------------------------------------------------------------------------------------------------
+// FluxRT's fixed-seed convention: 0 -> 52.
+static unsigned long long klein_seed(int seed) noexcept
+{
+  const auto s = static_cast<unsigned long long>(static_cast<uint32_t>(seed));
+  return s == 0 ? 52ull : s;
+}
+
+bool StreamDiffusion::configureKlein(const inputs_t& in)
+{
+  int w = 0, h = 0;
+  if(!resolveResolution(in, 16, w, h))
+    return false;
+  if(in.prompt.value.empty())
+    return false;
+
+  // The seed is baked in at creation and the engines come back from the library's own cache.
+  if(!m_klein_stream || m_model_dir != in.model.value
+     || m_klein_quality != in.klein_quality.value || m_w != w || m_h != h
+     || m_klein_seed != klein_seed(in.seed.value))
+  {
+    if(!createKleinStream(in))
+      return false;
+  }
+  auto stream = m_klein_stream.get();
+
+  // set_prompt runs the Qwen encoder, set_schedule / set_mask mutate what the producer reads.
+  if(m_klein_prompt != in.prompt.value)
+  {
+    stopProducer();
+    if(m_sd.flux2_stream_set_prompt(stream, in.prompt.value.c_str()) < 0)
+    {
+      std::fprintf(stderr, "FLUX.2-klein: set_prompt failed\n");
+      return false;
+    }
+    m_klein_prompt = in.prompt.value;
+  }
+
+  // Timesteps -> FlowMatch sigma schedule (list length = steps, first value = start noise level);
+  // anything that is not a sigma list means the natural 2-step schedule.
+  if(m_klein_sched != in.t1.value)
+  {
+    stopProducer();
+    const auto sigmas = get_sigmas(in.t1.value);
+    if(!sigmas.empty())
+      m_sd.flux2_stream_set_schedule(stream, sigmas.data(), (int)sigmas.size());
+    else
+      m_sd.flux2_stream_set_steps(stream, 2);
+    m_klein_sched = in.t1.value;
+  }
+
+  // Inpaint: the "Control / Style" texture is the mask (white = regenerate, black = keep).
+  const auto& mt = in.control.texture;
+  const bool inpaint = in.workflow.value == FLUX2_KLEIN_INPAINT && mt.bytes && mt.width > 0
+                       && mt.height > 0;
+  const uint64_t mask_hash = inpaint ? hash_bytes(mt.bytes, (size_t)mt.width * mt.height * 4) : 0;
+  if(mask_hash != m_klein_mask_hash)
+  {
+    stopProducer();
+    if(inpaint)
+    {
+      rgba_image mask(mt.bytes, mt.width, mt.height);
+      if(mt.width != m_w || mt.height != m_h)
+        mask = mask.scaled({m_w, m_h});
+      m_sd.flux2_stream_set_mask(stream, mask.constBits(), m_h, m_w);
     }
     else
-    {
-      // No control map this frame -> the controlnet engine would run on stale/zero
-      // cond. Skip the frame rather than emit an unconditioned image.
-      std::fprintf(stderr, "StreamDiffusion: ControlNet workflow but no control image on the "
-                  "'Control / Style' input\n");
-      return;
-    }
+      m_sd.flux2_stream_set_mask(stream, nullptr, 0, 0);
+    m_klein_mask_hash = mask_hash;
   }
+  return true;
+}
 
-  // IP-Adapter: feed the raw "Control / Style" texture through the on-device CLIP image
-  // encoder + projection (set_ipadapter_image) to produce the image tokens the IP-variant
-  // unet.engine consumes. The style is static, so we only re-encode when the texture content
-  // changes (hash) — not every frame. The per-layer style scale stays host-adjustable.
-  if(m_config_state.ipadapter_enabled)
+bool StreamDiffusion::createKleinStream(const inputs_t& in)
+{
+  int w = 0, h = 0;
+  if(!resolveResolution(in, 16, w, h))
+    return false;
+  const std::string& model = in.model.value;
+
+  // VAE batch-norm constants (128 fp32 each), vendored into every bundle by the exporter.
+  std::array<float, 128> bn_mean{}, bn_std{};
+  if(!read_bn_file(model + "/bn_mean.bin", bn_mean) || !read_bn_file(model + "/bn_std.bin", bn_std))
   {
-    if(m_sd.set_ipadapter_scale
-       && in_config.ipadapter_scale != m_config_state.ipadapter_scale)
-    {
-      m_config_state.ipadapter_scale = in_config.ipadapter_scale;
-      m_sd.set_ipadapter_scale(
-          m_cached_engine->pipeline->get(), m_config_state.ipadapter_scale);
-    }
-
-    if(m_sd.set_ipadapter_image)
-    {
-      const auto& style = in_config.control.texture;
-      if(style.bytes && style.width > 0 && style.height > 0)
-      {
-        // Fingerprint the style image; re-encode only on change (first frame or new image).
-        const std::size_t nbytes = std::size_t(style.width) * style.height * 4;
-        const uint64_t h = rapidhash(style.bytes, nbytes);
-        if(!m_config_state.ipadapter_image_set || h != m_config_state.ipadapter_style_hash)
-        {
-          m_sd.set_ipadapter_image(
-              m_cached_engine->pipeline->get(), style.bytes, style.height, style.width);
-          m_config_state.ipadapter_style_hash = h;
-          m_config_state.ipadapter_image_set = true;
-        }
-      }
-      else if(!m_config_state.ipadapter_image_set)
-      {
-        // No style image yet and none ever set -> the IP-variant unet.engine would throw on
-        // run (no tokens). Skip this frame rather than crash; the user must wire a style image.
-        std::fprintf(stderr, "StreamDiffusion: IP-Adapter workflow but no style image on the "
-                    "'Control / Style' input\n");
-        return;
-      }
-    }
+    std::fprintf(stderr, "FLUX.2-klein: %s lacks bn_mean.bin / bn_std.bin\n", model.c_str());
+    return false;
   }
 
-  // Runtime LoRA: if the loaded UNet engine declares lora_scale[N] (exported with --lora PATH:runtime),
-  // drive its strength live from the "LoRA scale" knob (uniform across all slots). Change-gated; a no-op
-  // for engines without the input (num_runtime_loras == 0).
-  if(need_update_lora)
+  // The producer holds the old stream's handle: drain + join before it is freed, and free it
+  // before the new one is created so both never share the VRAM.
+  stopProducer();
+  m_klein_stream.reset();
+  const std::string transformer
+      = model
+        + (in.klein_quality.value == Speed ? "/transformer_fp8_calib.plan"
+                                           : "/transformer_bf16.plan");
+  m_klein_stream = SDFluxStream{
+      transformer.c_str(), (model + "/qwen3_encoder_bf16.plan").c_str(),
+      (model + "/vae_decoder_bf16.plan").c_str(), (model + "/vae_encoder_bf16.plan").c_str(),
+      (model + "/tokenizer.json").c_str(), h / 16, w / 16, klein_seed(in.seed.value), m_device};
+  if(!m_klein_stream)
   {
-    const int nl = m_sd.num_runtime_loras(m_cached_engine->pipeline->get());
-    if(nl > 0)
+    std::fprintf(stderr, "FLUX.2-klein: failed to create the stream pipeline\n");
+    return false;
+  }
+  m_sd.flux2_stream_set_steps(m_klein_stream.get(), 2);
+  m_sd.flux2_stream_set_bn(m_klein_stream.get(), bn_mean.data(), bn_std.data());
+
+  m_model_dir = model;
+  m_w = w;
+  m_h = h;
+  m_klein_quality = in.klein_quality.value;
+  m_klein_seed = klein_seed(in.seed.value);
+  m_klein_prompt.clear();
+  m_klein_sched.clear();
+  m_klein_mask_hash = 0;
+  m_continuous = false;  // fixed-seed noise + cached reference: identical inputs, identical frame
+  m_rife.reset();
+  m_rife_tried = false;
+  return true;
+}
+
+// -------------------------------------------------------------------------------------------------
+// img2img-turbo configuration
+// -------------------------------------------------------------------------------------------------
+bool StreamDiffusion::configureTurbo(const inputs_t& in)
+{
+  const std::string& model = in.model.value;
+  if(!m_i2it || m_model_dir != model)
+  {
+    stopProducer();
+    m_i2it.reset();
+    m_i2it = SDImg2ImgTurbo{
+        (model + "/unet.engine").c_str(), (model + "/vae_encoder.engine").c_str(),
+        (model + "/vae_decoder.engine").c_str(), m_device};
+    if(!m_i2it)
     {
-      m_config_state.lora_scale = in_config.lora_scale;
-      for(int i = 0; i < nl; i++)
-        m_sd.set_lora_scale(m_cached_engine->pipeline->get(), i, m_config_state.lora_scale);
+      std::fprintf(stderr, "img2img-turbo: create failed for %s\n", model.c_str());
+      return false;
     }
-  }
-
-  // Async (option A): for plain SD/SDXL txt2img/img2img, diffuse on a background producer thread
-  // (it blocks on the pipeline's own CUDA stream) and present steady-clock-paced frames here, so a
-  // slow model (e.g. SDXL @1024 ~10fps) never stalls the score tick and RIFE can fill between
-  // keyframes. CN/IP workflows upload conditioning every tick on this thread and are excluded for now.
-  if (in_config.klein_async.value && sdAsyncEligible(in_config.workflow.value))
-  {
-    runSDAsync(in_config, input_tex_bytes, model_tex_w, model_tex_h);
-    m_prev_inputs = inputs;
-    return;
-  }
-  // Not async (or not eligible): ensure no background producer is left running on this pipeline.
-  if (m_sd_producer && m_sd_producer->running())
-  {
-    stopSDProducer();
-    ++m_sd_gen;
-  }
-
-  // The return code decides whether a frame is published at all: a failed txt2img/img2img leaves
-  // outputs.image holding the previous frame (or a fresh, uninitialised allocation).
-  bool frame_ok = false;
-  switch (this->inputs.workflow)
-  {
-    case Workflow::FLUX2_KLEIN_TXT2IMG:
-    case Workflow::FLUX2_KLEIN_IMG2IMG:
-    case Workflow::FLUX2_KLEIN_INPAINT:
-      // Handled by runKlein() above; never reached here.
-      return;
-    case Workflow::SD_TXT2IMG:
-    case Workflow::SD_TXT2IMG_CONTROLNET:
-    case Workflow::SDXL_TXT2IMG_CONTROLNET:
-    case Workflow::SD_TXT2IMG_IPADAPTER:
-    case Workflow::SDTURBO_TXT2IMG:
-    case Workflow::SDXL_TXT2IMG:
-    case Workflow::V2V_TXT2IMG:
+    // The geometry is the engines' own, not the Resolution port's.
+    int w = 0, h = 0;
+    if(m_sd.img2img_turbo_frame_size(m_i2it.get(), &w, &h) != LIBREDIFFUSION_SUCCESS || w <= 0
+       || h <= 0)
     {
-      const auto err = m_sd.txt2img(m_cached_engine->pipeline->get(),
-                                    outputs.image.texture.bytes,
-                                    model_tex_w,
-                                    model_tex_h);
-      if (err != LIBREDIFFUSION_SUCCESS)
-        std::fprintf(stderr, "StreamDiffusion: txt2img failed (%d)\n", (int)err);
-      else
-        frame_ok = true;
-      break;
+      std::fprintf(stderr, "img2img-turbo: engine reports an unusable geometry %dx%d\n", w, h);
+      m_i2it.reset();
+      return false;
     }
-
-    case Workflow::SD_IMG2IMG:
-    case Workflow::SD_IMG2IMG_CONTROLNET:
-    case Workflow::SDXL_IMG2IMG_CONTROLNET:
-    case Workflow::SD_IMG2IMG_IPADAPTER:
-    case Workflow::SDTURBO_IMG2IMG:
-    case Workflow::SDXL_IMG2IMG:
-    case Workflow::V2V_IMG2IMG:
-      if (input_tex_bytes)
-      {
-        const auto err = m_sd.img2img(
-            m_cached_engine->pipeline->get(), input_tex_bytes,
-            outputs.image.texture.bytes, model_tex_w, model_tex_h);
-        if (err != LIBREDIFFUSION_SUCCESS)
-        {
-          std::fprintf(stderr, "StreamDiffusion: img2img failed (%d)\n", (int)err);
-          break;
-        }
-        frame_ok = true;
-
-        if(inputs.feed_prev_in > 0)
-        {
-          m_prev_input = lo::rgba_image(input_tex_bytes, model_tex_w, model_tex_h);
-        }
-
-        if(inputs.feed_prev_out > 0)
-        {
-          m_prev_output = lo::rgba_image(
-              outputs.image.texture.bytes, model_tex_w, model_tex_h);
-        }
-      }
-      break;
+    m_w = w;
+    m_h = h;
+    m_model_dir = model;
+    m_continuous = false;
+    m_rife.reset();
+    m_rife_tried = false;
+    // Prompt path: sd-turbo CLIP (1024-dim, pad 0); optional, the Embedding port overrides it.
+    m_i2it_clip = SDClip{(model + "/clip.engine").c_str(), m_device};
+    m_i2it_embeddings.reset();
+    m_i2it_prompt.clear();
   }
 
-  // Only PUBLICATION is conditional. m_prev_inputs is what every need_update_* comparison next tick
-  // is made against: leaving it stale on failure re-derives the whole configuration -- CLIP encode,
-  // device alloc/free, prepare_scheduler (which ends in a cudaStreamSynchronize) and a
-  // set_guidance_scale that discards the captured CUDA graph -- on EVERY tick, at score's rate. The
-  // setup back-off cannot stop it: noteSetupSuccess() has already run by the time inference fails.
-  this->outputs.image.texture.changed = frame_ok;
-  m_prev_inputs = inputs;
+  if(m_i2it_clip && m_i2it_prompt != in.prompt.value)
+  {
+    stopProducer();
+    m_i2it_embeddings.reset();
+    if(m_sd.clip_compute_embeddings(
+           m_i2it_clip.get(), in.prompt.value.c_str(), 0, nullptr, &m_i2it_embeddings.embeddings)
+       != LIBREDIFFUSION_SUCCESS)
+      m_i2it_embeddings.embeddings = nullptr;
+    m_i2it_prompt = in.prompt.value;
+  }
+  return true;
 }
 
 }

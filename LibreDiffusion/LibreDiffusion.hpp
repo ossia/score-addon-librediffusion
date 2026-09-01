@@ -1,183 +1,29 @@
 #pragma once
 #include "AsyncFrameProducer.hpp"
-#include "librediffusion_loader.hpp"
-
-// The triple buffer comes with AsyncFrameProducer.hpp above.
-
+#include "Handles.hpp"
 #include "Image.hpp"
 
-#include <halp/buffer.hpp>
 #include <halp/controls.hpp>
 #include <halp/meta.hpp>
 #include <halp/texture.hpp>
 
-#include <atomic>
-#include <condition_variable>
+#include <cstdint>
 #include <memory>
-#include <deque>
-#include <functional>
-#include <mutex>
-#include <stop_token>
+#include <optional>
 #include <string>
-#include <thread>
 #include <vector>
+
 namespace lo
 {
 struct CachedEngine;
-}
 
-namespace lo
-{
-
-class SDConfig
-{
-public:
-  SDConfig();
-  ~SDConfig();
-  SDConfig(const SDConfig&) = delete;
-  SDConfig& operator=(const SDConfig&) = delete;
-  SDConfig(SDConfig&& other) noexcept;
-  SDConfig& operator=(SDConfig&& other) noexcept;
-
-  explicit operator bool() const noexcept { return m_handle != nullptr; }
-  librediffusion_config_handle get() const noexcept { return m_handle; }
-  librediffusion_config_handle release() noexcept;
-
-private:
-  librediffusion_config_handle m_handle{nullptr};
-};
-
-class SDPipeline
-{
-public:
-  SDPipeline() = default;
-  explicit SDPipeline(librediffusion_config_handle config);
-  ~SDPipeline();
-  SDPipeline(const SDPipeline&) = delete;
-  SDPipeline& operator=(const SDPipeline&) = delete;
-  SDPipeline(SDPipeline&& other) noexcept;
-  SDPipeline& operator=(SDPipeline&& other) noexcept;
-
-  explicit operator bool() const noexcept { return m_handle != nullptr; }
-  librediffusion_pipeline_handle get() const noexcept { return m_handle; }
-  void reset();
-
-private:
-  librediffusion_pipeline_handle m_handle{nullptr};
-};
-
-class SDClip
-{
-public:
-  SDClip() = default;
-  SDClip(const char* engine_path, int device);
-  ~SDClip();
-  SDClip(const SDClip&) = delete;
-  SDClip& operator=(const SDClip&) = delete;
-  SDClip(SDClip&& other) noexcept;
-  SDClip& operator=(SDClip&& other) noexcept;
-
-  explicit operator bool() const noexcept { return m_handle != nullptr; }
-  librediffusion_clip_handle get() const noexcept { return m_handle; }
-
-private:
-  librediffusion_clip_handle m_handle{nullptr};
-};
-
-/**
- * @brief RAII wrapper around a FLUX.2-klein streaming pipeline handle.
- */
-class SDFluxStream
-{
-public:
-  SDFluxStream() = default;
-  SDFluxStream(
-      const char* transformer, const char* qwen, const char* vae_decoder,
-      const char* vae_encoder, const char* tokenizer_json, int Th, int Tw,
-      unsigned long long seed);
-  ~SDFluxStream();
-  SDFluxStream(const SDFluxStream&) = delete;
-  SDFluxStream& operator=(const SDFluxStream&) = delete;
-  SDFluxStream(SDFluxStream&& other) noexcept;
-  SDFluxStream& operator=(SDFluxStream&& other) noexcept;
-
-  explicit operator bool() const noexcept { return m_handle != nullptr; }
-  librediffusion_flux2_stream_handle get() const noexcept { return m_handle; }
-  void reset();
-
-private:
-  librediffusion_flux2_stream_handle m_handle{nullptr};
-};
-
-/**
- * @brief RAII wrapper around a RIFE frame interpolator handle.
- */
-class SDRife
-{
-public:
-  SDRife() = default;
-  explicit SDRife(const char* engine_path);
-  ~SDRife();
-  SDRife(const SDRife&) = delete;
-  SDRife& operator=(const SDRife&) = delete;
-  SDRife(SDRife&& other) noexcept;
-  SDRife& operator=(SDRife&& other) noexcept;
-
-  explicit operator bool() const noexcept { return m_handle != nullptr; }
-  librediffusion_rife_handle get() const noexcept { return m_handle; }
-  void reset();
-
-private:
-  librediffusion_rife_handle m_handle{nullptr};
-};
-
-/**
- * @brief RAII wrapper around an img2img-turbo (GaParmar/img2img-turbo) skip-VAE pipeline handle.
- */
-class SDImg2ImgTurbo
-{
-public:
-  SDImg2ImgTurbo() = default;
-  SDImg2ImgTurbo(const char* unet, const char* vae_encoder, const char* vae_decoder);
-  ~SDImg2ImgTurbo();
-  SDImg2ImgTurbo(const SDImg2ImgTurbo&) = delete;
-  SDImg2ImgTurbo& operator=(const SDImg2ImgTurbo&) = delete;
-  SDImg2ImgTurbo(SDImg2ImgTurbo&& other) noexcept;
-  SDImg2ImgTurbo& operator=(SDImg2ImgTurbo&& other) noexcept;
-
-  explicit operator bool() const noexcept { return m_handle != nullptr; }
-  librediffusion_img2img_turbo_handle get() const noexcept { return m_handle; }
-  void reset();
-
-private:
-  librediffusion_img2img_turbo_handle m_handle{nullptr};
-};
-
-struct SDXLEmbeddings
-{
-  librediffusion_half_t* embeddings{nullptr};
-  librediffusion_half_t* pooled_embeds{nullptr};
-  librediffusion_half_t* time_ids{nullptr};
-
-  SDXLEmbeddings() = default;
-  ~SDXLEmbeddings();
-  SDXLEmbeddings(const SDXLEmbeddings&) = delete;
-  SDXLEmbeddings& operator=(const SDXLEmbeddings&) = delete;
-  SDXLEmbeddings(SDXLEmbeddings&& other) noexcept;
-  SDXLEmbeddings& operator=(SDXLEmbeddings&& other) noexcept;
-
-  void reset();
-  explicit operator bool() const noexcept { return embeddings != nullptr; }
-};
-
+// Settings of an SD-family pipeline (SD1.5 / SD-turbo / SDXL / V2V), as pushed through the config API.
 struct SDConfigState
 {
   librediffusion_model_type_t model_type{MODEL_SD_15};
   librediffusion_pipeline_mode_t pipeline_mode{MODE_SINGLE_FRAME};
   int width{512};
   int height{512};
-  int latent_width{64};
-  int latent_height{64};
   int batch_size{1};
   int denoising_steps{1};
   float guidance_scale{1.2f};
@@ -185,34 +31,26 @@ struct SDConfigState
   bool do_add_noise{true};
   bool use_denoising_batch{false};
   int cfg_type{2};
-  int device{0};
   int text_seq_len{77};
   int text_hidden_dim{768};
   int clip_pad_token{49407};
   int pooled_embedding_dim{1280};
   std::vector<int> timestep_indices;
-  std::string unet_engine_path;
-  std::string vae_encoder_path;
-  std::string vae_decoder_path;
 
-  // ControlNet: index returned by config_add_controlnet (>=0 when enabled, else -1).
-  int controlnet_index{-1};
-  float controlnet_scale{0.6f};
-  // IP-Adapter: enabled when the workflow is *_IPADAPTER (engine auto-detected as IP-variant).
+  int controlnet_index{-1};  // >= 0 when the workflow drives a ControlNet
   bool ipadapter_enabled{false};
-  int ipadapter_num_tokens{4};
+
+  // Live parameters as last pushed to the pipeline (by the producer thread, from the job).
+  float controlnet_scale{0.6f};
   float ipadapter_scale{0.7f};
-  // IP-Adapter on-device image encoder: fingerprint of the last style image fed via
-  // set_ipadapter_image, so we only re-encode when the "Control / Style" texture changes.
-  uint64_t ipadapter_style_hash{0};
-  bool ipadapter_image_set{false};
-  // Runtime LoRA: the loaded UNet engine declares lora_scale[N] (engines exported with PATH:runtime).
-  // Last applied uniform scale (so we only push on change).
-  float lora_scale{1.0f};
+  float lora_scale{-1.f};  // -1: not pushed yet (the engine may have no runtime-LoRA slots)
+  int seed{0};
+  bool seeded{false};
 };
 
 /**
- * @brief StreamDiffusion processor using dynamic C API
+ * @brief Real-time diffusion (SD1.5 / SD-turbo / SDXL / StreamV2V / FLUX.2-klein / img2img-turbo)
+ * through the librediffusion C API, loaded at runtime.
  */
 struct StreamDiffusion
 {
@@ -244,25 +82,23 @@ public:
     FLUX2_KLEIN_TXT2IMG,
     FLUX2_KLEIN_IMG2IMG,
     FLUX2_KLEIN_INPAINT,
-    // github.com/GaParmar/img2img-turbo (pix2pix-turbo / CycleGAN-turbo skip-VAE). One-step image
-    // translation: input frame + a CLIP text embedding (via the "Embedding" port) -> output.
-    // NOT a generic SD-turbo img2img workflow. Self-contained C-API (librediffusion_img2img_turbo_*).
+    // github.com/GaParmar/img2img-turbo (pix2pix-turbo / CycleGAN-turbo skip-VAE): one-step image
+    // translation from the input frame and a CLIP text embedding. Not a generic SD-turbo img2img.
     IMG2IMG_TURBO,
   };
 
   enum KleinQuality : int8_t
   {
-    Quality, // transformer_bf16.plan  (higher fidelity)
-    Speed    // transformer_fp8_calib.plan (faster)
+    Quality, // transformer_bf16.plan
+    Speed    // transformer_fp8_calib.plan
   };
 
-  // Async present model: how the render thread plays the producer's RIFE sweeps. Trades latency vs
-  // motion continuity. (Only used when Async is on.)
-  enum KleinPacing : int8_t
+  // How the render thread plays the producer's frames when Async is on: latency vs continuity.
+  enum Pacing : int8_t
   {
-    Smooth,  // sequential FIFO, no skips: play every sweep in order -> continuous motion, +latency
-    Fresh,   // newest-wins, 1-keyframe latency, blend the boundary -> low latency, slight morph at seams
-    LowLatency // newest-wins, no buffer: present the latest sweep ASAP, hold last frame if late
+    Smooth,    // deep FIFO, every frame in order: continuous motion, more latency
+    Fresh,     // one keyframe of buffering
+    LowLatency // present the newest frame as soon as possible
   };
 
   enum Cfg : int8_t
@@ -273,22 +109,18 @@ public:
     Initialize
   };
 
-
   struct inputs_t
   {
-    // NOTE the `{}`: halp::texture_input is an aggregate whose rgba_texture has no default member
-    // initialisers and avendish default-initialises the effect, so without it
-    // texture.{bytes,width,height,changed} are indeterminate until the host writes them.
+    // The `{}`: halp::texture_input is an aggregate whose rgba_texture has no default member
+    // initialisers, so without it the texture fields are indeterminate until the host writes them.
     halp::texture_input<"In"> image{};
-    // ControlNet control map (canny/depth/pose/...) OR IP-Adapter style image.
-    // Preprocessing is EXTERNAL: feed an already-preprocessed control map here for
-    // ControlNet. Only used by the *_CONTROLNET / *_IPADAPTER workflows.
+    // ControlNet control map (already preprocessed: canny/depth/pose/...), IP-Adapter style image,
+    // or the FLUX.2-klein inpaint mask (white = regenerate).
     halp::texture_input<"Control / Style"> control{};
-    // img2img-turbo (IMG2IMG_TURBO) only: the CLIP text embedding [1,77,1024] = 78848 floats, fed from
-    // upstream (a prompt-encoder object, or a baked constant for the CycleGAN day2night/etc. models).
-    // Keeps CLIP-text out of this node. Unused by every other workflow. (A plain float list, not a
-    // texture/cpu_buffer: GFX nodes only accept parameter/texture inputs, so it rides on a value port.)
+    // img2img-turbo only: an external CLIP text embedding [1,77,1024] = 78848 floats. When empty the
+    // embedding is derived from the Prompt through the bundle's clip.engine.
     halp::val_port<"Embedding", std::vector<float>> ehs;
+    // Manual mode: render one frame per impulse.
     halp::val_port<"Trigger", std::optional<halp::impulse>> trigger;
     struct : halp::enum_t<Workflow, "Workflow">
     {
@@ -340,7 +172,10 @@ public:
     struct : halp::toggle<"Denoising batch">
     {
     } denoise_batch;
-    halp::toggle<"Manual mode"> manual;
+    struct : halp::toggle<"Manual mode">
+    {
+      halp_meta(description, "Render a new frame only when Trigger fires; otherwise hold the last one")
+    } manual;
 
     struct : halp::knob_f32<"Delta", halp::range{0.0, 2.0, 1.0}>
     {
@@ -353,27 +188,22 @@ public:
     {
     } feed_prev_out;
 
-    // ControlNet conditioning scale (only used by the *_CONTROLNET workflow).
     struct : halp::knob_f32<"ControlNet scale", halp::range{0.0, 2.0, 0.6}>
     {
       halp_meta(description, "ControlNet conditioning strength (control-aware unet.engine + controlnet.engine required)")
     } controlnet_scale;
 
-    // IP-Adapter scale (only used by the *_IPADAPTER workflows).
     struct : halp::knob_f32<"IP-Adapter scale", halp::range{0.0, 2.0, 0.7}>
     {
       halp_meta(description, "IP-Adapter style strength (IP-variant unet.engine required)")
     } ipadapter_scale;
 
-    // Runtime LoRA strength: live-adjustable when the engine was exported with --lora PATH:runtime
-    // (UNet declares a lora_scale input). 1 = LoRA fully on (== a baked engine), 0 = off. Applied
-    // uniformly to all runtime-LoRA slots; ignored by engines without a lora_scale input.
+    // Live when the engine was exported with --lora PATH:runtime; ignored otherwise.
     struct : halp::knob_f32<"LoRA scale", halp::range{0.0, 2.0, 1.0}>
     {
       halp_meta(description, "Runtime LoRA strength (engine exported with --lora PATH:runtime)")
     } lora_scale;
 
-    // FLUX.2-klein only: which transformer engine to load (fidelity vs speed)
     struct : halp::enum_t<KleinQuality, "Klein quality">
     {
       halp_meta(description, "FLUX.2-klein: bf16 (Quality) vs fp8 (Speed) transformer")
@@ -383,42 +213,64 @@ public:
       };
     } klein_quality;
 
-    // RIFE output frame interpolation factor: 2^exp displayed frames per real frame.
-    // 0 = off (opt-in). Only used on the FLUX.2-klein paths.
+    // RIFE optical-flow interpolation between rendered frames: 2^exp displayed frames per rendered one.
+    // Needs rife_ifnet_fp16.plan in the engine folder or its parent.
     struct : halp::spinbox_i32<"Interpolation exp", halp::range{0, 3, 0}>
     {
-      halp_meta(description, "RIFE optical-flow interpolation: 0=off, 1=2x, 2=4x, 3=8x (klein output)")
+      halp_meta(description, "RIFE optical-flow interpolation: 0=off, 1=2x, 2=4x, 3=8x")
     } rife_exp;
 
-    // Run diffusion on a worker thread (async) so the render thread emits a smooth, steady-clock-paced
-    // frame every tick instead of stalling on diffusion. FLUX.2-klein and plain SD/SD-turbo/SDXS/SDXL
-    // txt2img/img2img (the slow ones — e.g. SDXL @1024 ~10fps — benefit most); ControlNet/IP-Adapter
-    // stay synchronous for now (per-tick conditioning).
     struct : halp::toggle<"Async">
     {
       halp_meta(description, "Diffuse on a worker thread; the render thread presents steady-clock-paced "
-                             "frames and (with RIFE) interpolates between the latest real frames. Off = "
-                             "synchronous (diffuse on the render thread). Applies to klein and plain "
-                             "SD/SDXL txt2img/img2img; CN/IP stay synchronous.")
-    } klein_async;
+                             "frames (and RIFE sweeps) instead of stalling on the GPU. Off = render on the "
+                             "render thread.")
+    } async_mode;
 
-    // FLUX.2-klein async only: how the render thread plays the producer's sweeps (latency vs continuity).
-    struct : halp::enum_t<KleinPacing, "Async pacing">
+    struct : halp::enum_t<Pacing, "Async pacing">
     {
-      halp_meta(description, "Async present model: Smooth (sequential FIFO, continuous motion, +latency); "
-                             "Fresh (newest-wins, 1-keyframe latency, blended seams); "
-                             "LowLatency (newest ASAP, may micro-hold).")
+      halp_meta(description, "Smooth (every frame in order, +latency); Fresh (one keyframe of buffering); "
+                             "LowLatency (newest frame as soon as possible)")
       enum widget { combobox };
-    } klein_pacing;
+    } pacing;
+
+    struct : halp::spinbox_i32<"GPU", halp::range{0, 15, 0}>
+    {
+      halp_meta(description, "CUDA device ordinal (CUDA's fastest-first order, not necessarily nvidia-smi's). "
+                             "Changing it reloads the engines on that device; engines already loaded "
+                             "elsewhere stay resident until the host restarts.")
+    } gpu;
+
+    // ---- Engine builder: runs the embedded exporter (uv + train-lora.py) out of process. ----
+    struct : halp::lineedit<"Python cache", "">
+    {
+      halp_meta(description, "Root for the Python toolchain (uv cache, interpreter, venv, exporter). "
+                             "Keep it SHORT on Windows (default C:\\lrd): long venv paths break some wheels.")
+      enum widget
+      {
+        folder
+      };
+    } python_cache;
+    struct : halp::lineedit<"Build folder", "">
+    {
+      halp_meta(description, "Where the built engines go (train-lora.py --output). Empty = the Engines folder.")
+      enum widget
+      {
+        folder
+      };
+    } build_folder;
+    struct : halp::lineedit<"Build options", "--type sd15 --model stabilityai/sd-turbo --min-resolution 512 --max-resolution 512">
+    {
+      halp_meta(description, "train-lora.py arguments (everything but --output)")
+    } build_options;
+    halp::val_port<"Build", std::optional<halp::impulse>> build;
   } inputs;
 
   struct
   {
     halp::texture_output<"Out"> image;
+    halp::val_port<"Build status", std::string> build_status;
   } outputs;
-
-  // Async producer/consumer payloads (AsyncFrame keyframe+sweep, AsyncJob ref+exp) are the shared
-  // types in AsyncFrameProducer.hpp — used identically by the klein and SD/SDXL async paths.
 
   StreamDiffusion() noexcept;
   ~StreamDiffusion();
@@ -428,25 +280,23 @@ public:
   static bool is_available() noexcept;
 
 private:
-  void blendTextures();
-  const sd::liblibrediffusion& m_sd;
+  enum class Family : int8_t
+  {
+    SD,     // SD1.5 / SD-turbo / SDXL / StreamV2V through the pipeline + CLIP + EngineCache
+    Klein,  // FLUX.2-klein streaming pipeline
+    Turbo   // img2img-turbo skip-VAE pipeline
+  };
+  static Family familyOf(Workflow) noexcept;
+  static bool isImg2Img(Workflow) noexcept;
+  static bool isControlNet(Workflow) noexcept;
+  static bool isIPAdapter(Workflow) noexcept;
 
-  CachedEngine* m_cached_engine{nullptr};
-  SDConfigState m_config_state;
-  std::vector<SDXLEmbeddings> m_embeddings;
-  SDXLEmbeddings m_negative_embeddings;
-
-  inputs_t m_prev_inputs{};
-
-  // Replace non-finite knob values with their port defaults and clamp the ones whose arithmetic
-  // is not defined out of range. Runs once at the top of every tick, on `inputs` itself, so every
-  // reader downstream sees the same sane value.
+  // Replace non-finite knob values with their defaults and clamp the ones whose arithmetic is not
+  // defined out of range.
   void sanitizeControls();
 
-  // The inputs that determine whether the engine / scheduler / embedding setup can succeed at all.
-  // The continuous knobs (guidance, delta, seed, the scales) are deliberately absent: they cannot
-  // cause a setup failure, and an automated knob must not defeat the back-off by changing every
-  // tick.
+  // The inputs that decide whether setup can succeed at all. A configuration that failed is not
+  // retried until one of them changes; continuous knobs are deliberately absent.
   struct SetupKey
   {
     std::string model;
@@ -455,133 +305,104 @@ private:
     std::string timesteps;
     int width{0};
     int height{0};
+    int gpu{0};
     int8_t workflow{-1};
     int8_t cfg{-1};
     int8_t klein_quality{-1};
     bool add_noise{false};
     bool denoise_batch{false};
-    bool valid{false};   // false = "no failure recorded"
+    bool valid{false};
 
     friend bool operator==(const SetupKey&, const SetupKey&) noexcept = default;
   };
-  static SetupKey setupKey(const inputs_t& in_config);
-  // true when the identical input set already failed to set up: skip the tick instead of
-  // re-attempting a full engine load at the host's tick rate.
-  bool setupBlocked(const inputs_t& in_config) const;
-  void noteSetupFailure(const inputs_t& in_config);
+  static SetupKey setupKey(const inputs_t& in);
+  bool setupBlocked(const inputs_t& in) const;
+  void noteSetupFailure(const inputs_t& in) { m_failed_setup = setupKey(in); }
   void noteSetupSuccess() noexcept { m_failed_setup.valid = false; }
   SetupKey m_failed_setup{};
 
-  // Validate + clamp the Resolution port (positive, <= k_max_resolution). Returns false when the
-  // request cannot be honoured at all, in which case the frame must be skipped.
-  bool resolveResolution(const inputs_t& in_config, int& w, int& h);
-  int m_reported_size_w{0};   // last diagnosed bad Resolution (report once, not once per tick)
+  // Validate + clamp the Resolution port (positive, <= k_max_resolution, multiple of `step`).
+  // False when the request cannot be honoured at all.
+  bool resolveResolution(const inputs_t& in, int step, int& w, int& h);
+  int m_reported_size_w{0};
   int m_reported_size_h{0};
 
-  bool createConfiguration(const inputs_t& in_config, const std::vector<int>& timestep_indices);
+  // ---- Configuration: render thread. Every mutation of a pipeline stops the producer first. ----
+  bool configure(const inputs_t& in);
+  bool configureSD(const inputs_t& in);
+  bool createSDPipeline(const inputs_t& in, std::vector<int> timestep_indices);
   bool updatePromptEmbedding(const std::string& prompt, SDXLEmbeddings& embeddings);
   bool updatePromptEmbeddings(const std::string& prompt, std::vector<SDXLEmbeddings>& embeddings);
   bool updateScheduler(const std::string& timestep_str);
+  bool configureKlein(const inputs_t& in);
+  bool createKleinStream(const inputs_t& in);
+  bool configureTurbo(const inputs_t& in);
+  // Drop the current family's pipelines, the RIFE handle and every frame in flight.
+  void releaseFamily();
 
-  // FLUX.2-klein streaming path (self-contained, bypasses the SD pipeline machinery)
-  void runKlein(const inputs_t& in_config);
-  bool createKleinStream(const inputs_t& in_config);
-  // Drop the whole klein side (producer thread, RIFE handles, stream handle, cached state) when
-  // the workflow moves away from klein: nothing else ever stops that thread, which holds ~10 GB of
-  // VRAM and keeps diffusing flat out for as long as the node lives.
-  void releaseKleinResources();
-  // The effective klein seed for an input set (FluxRT's fixed-seed convention: 0 -> 52). Shared
-  // by createKleinStream and runKlein's recreate condition so they can never disagree.
-  static unsigned long long kleinSeed(const inputs_t& in_config) noexcept;
-  // Same for the img2img-turbo handle (engines + CLIP + its device embedding).
-  void releaseTurboResources();
+  // ---- Rendering: the producer thread when Async is on, the render thread otherwise. ----
+  bool produceFrame(AsyncJob& job, AsyncFrame& out);
+  bool renderFrame(const AsyncJob& job, unsigned char* out_rgba);
+  bool renderSD(const AsyncJob& job, unsigned char* out_rgba);
+  bool renderKlein(const AsyncJob& job, unsigned char* out_rgba);
+  bool renderTurbo(const AsyncJob& job, unsigned char* out_rgba);
+  void interpolate(const AsyncJob& job, AsyncFrame& out);
 
-  // img2img-turbo path (self-contained skip-VAE C-API; static 512x512, one-step, host RGBA bytes)
-  void runImg2ImgTurbo(const inputs_t& in_config);
-  SDImg2ImgTurbo m_i2it;
-  std::string m_i2it_model_path;
-  std::vector<unsigned char> m_i2it_in;   // input frame, RGBA8 512x512 (persistent scratch)
-  std::vector<unsigned char> m_i2it_out;  // output frame, RGBA8 512x512 (persistent scratch)
-  SDClip m_i2it_clip;                      // CLIP encoder (prompt -> embedding), like SD/SDXL
-  SDXLEmbeddings m_i2it_embeddings;        // device fp16 [1,77,1024] derived from the prompt
-  std::string m_i2it_prompt;               // last prompt, to recompute only on change
+  // ---- Per tick ----
+  void builderTick(const inputs_t& in, bool build_requested);
+  bool buildJob(const inputs_t& in, AsyncJob& job);
+  void blendFeedback(rgba_image& cur, const inputs_t& in);
+  void renderTick(const inputs_t& in, bool triggered);
+  void ensureProducer(bool continuous);
+  void stopProducer();
 
+  const sd::liblibrediffusion& m_sd;
+  inputs_t m_prev_inputs{};
+  Family m_family{Family::SD};
+  int m_device{0};
+  std::string m_model_dir;   // the Engines folder the current pipelines were loaded from
+  int m_w{0}, m_h{0};        // model output size
+  bool m_continuous{false};  // the pipeline's output evolves between identical calls
+  uint64_t m_gen{0};         // bumped on every configuration change
+
+  // SD family
+  CachedEngine* m_cached_engine{nullptr};
+  SDConfigState m_config_state;
+  std::vector<SDXLEmbeddings> m_embeddings;
+  SDXLEmbeddings m_negative_embeddings;
+
+  // FLUX.2-klein family
   SDFluxStream m_klein_stream;
-  SDRife m_rife;
-  std::string m_klein_model_path;
   int m_klein_quality{-1};
-  unsigned long long m_klein_seed{0};   // seed the live stream was created with (0 = no stream)
-  int m_klein_w{0};
-  int m_klein_h{0};
+  unsigned long long m_klein_seed{0};
   std::string m_klein_prompt;
-  std::string m_klein_sched;                   // last-applied Timesteps string (klein sigma schedule)
-  uint64_t m_klein_mask_hash{0};               // hash of the last-applied inpaint mask (0 = none)
-  std::vector<unsigned char> m_klein_prev_out; // last real klein frame, for RIFE
-  std::vector<unsigned char> m_rife_scratch;   // (2^exp) frames buffer
-  bool m_klein_have_prev{false};
-  // Task 1: cached reference — re-encode (VAE) only when the input frame changes.
-  uint64_t m_klein_ref_hash{0};
-  bool m_klein_ref_set{false};
-  // Task 2: RIFE display decoupling — emit one queued frame per tick; diffuse only when
-  // the queue is empty (every ~2^exp ticks), so diffusion runs only when necessary.
-  std::deque<std::vector<unsigned char>> m_klein_queue;
-  int m_klein_last_exp{-1};
+  std::string m_klein_sched;
+  uint64_t m_klein_mask_hash{0};
 
-  // ---- Async (Phase C): steady-clock paced producer/consumer, SHARED between klein and SD/SDXL. -----
-  // A node-owned producer thread runs the heavy diffusion (+RIFE) on the model's own CUDA stream and
-  // publishes finished keyframe+sweep frames through a lock-free triple_buffer; the render thread
-  // (runKleinAsync / runSDAsync -> presentAsync) presents ONE credit-paced sub-frame per tick, fully
-  // decoupled. Both paths use the same AsyncFrameProducer + PacedFrameConsumer (see AsyncFrameProducer.hpp).
+  // img2img-turbo family
+  SDImg2ImgTurbo m_i2it;
+  SDClip m_i2it_clip;
+  SDXLEmbeddings m_i2it_embeddings;
+  std::string m_i2it_prompt;
 
-  // Shared render-side driver: submit a job when the reference/exp changes, consume the freshest
-  // keyframe into `consumer`, and present one paced frame to outputs.image. `ref_constant_hash` is true
-  // for txt2img (black ref hashes constant -> submitted once).
-  void presentAsync(
-      AsyncFrameProducer<AsyncJob, AsyncFrame>& producer, PacedFrameConsumer& consumer,
-      const unsigned char* ref, bool have_input, int exp, uint64_t gen, int pacing, int w, int h,
-      bool ref_constant_hash, uint64_t& ref_hash, bool& ref_set, int& last_exp, double& last_tick_t);
+  // Producer-thread state (the render thread touches it only while the producer is stopped).
+  SDRife m_rife;
+  bool m_rife_tried{false};
+  std::vector<unsigned char> m_prev_key;  // previous keyframe, interpolated from
+  uint64_t m_applied_ref_hash{0};         // klein: reference currently VAE-encoded
+  uint64_t m_applied_control_hash{0};     // SD: control map / style image currently uploaded
+  bool m_reported_no_style{false};
 
-  // --- FLUX.2-klein async (the producer body calls flux2_stream_set_reference + frame_cached + RIFE) ---
-  void runKleinAsync(const inputs_t& in_config);
-  void ensureKleinProducer();
-  void stopKleinProducer();
-
-  std::unique_ptr<AsyncFrameProducer<AsyncJob, AsyncFrame>> m_klein_producer;
-  PacedFrameConsumer m_klein_consumer;
-  SDRife m_klein_producer_rife;                 // RIFE handle owned by the klein producer thread
-  std::vector<unsigned char> m_klein_prev_key;  // previous keyframe (producer-side) to interpolate from
-  bool m_klein_have_prev_key{false};
-  std::string m_klein_rife_path;                // rife engine path (lazy producer-side create)
-  uint64_t m_klein_async_ref_hash{0};
-  bool m_klein_async_ref_set{false};
-  int m_klein_async_exp{-1};                    // last exp submitted (change detect)
-  double m_klein_last_tick_t{0.0};              // wall time of previous async tick (render dt)
-  uint64_t m_klein_gen{0};                      // bumped on config change -> invalidates in-flight jobs
-
-  // --- Generic async for SD/SD-turbo/SDXS/SDXL (producer body calls txt2img/img2img + RIFE). Scoped to
-  // plain txt2img/img2img (no per-tick CN/IP conditioning). ---
-  void runSDAsync(const inputs_t& in_config, unsigned char* input_tex_bytes, int w, int h);
-  void ensureSDProducer();
-  void stopSDProducer();
-  static bool sdAsyncEligible(int8_t workflow) noexcept;
-
-  std::unique_ptr<AsyncFrameProducer<AsyncJob, AsyncFrame>> m_sd_producer;
-  PacedFrameConsumer m_sd_consumer;
-  SDRife m_sd_producer_rife;                    // RIFE handle owned by the SD producer thread
-  std::vector<unsigned char> m_sd_prev_key;     // previous keyframe (producer-side) to interpolate from
-  bool m_sd_have_prev_key{false};
-  bool m_sd_async_img2img{false};               // stable while the producer runs (workflow change rebuilds)
-  std::string m_sd_rife_path;                   // rife engine path (lazy producer-side create)
-  uint64_t m_sd_gen{0};                         // bumped on config change -> invalidates in-flight jobs
-  uint64_t m_sd_async_ref_hash{0};
-  bool m_sd_async_ref_set{false};
-  int m_sd_async_exp{-1};                       // last exp submitted (change detect)
-  double m_sd_last_tick_t{0.0};                 // wall time of previous async tick (render dt)
-
-  lo::rgba_image m_prev_input;
-  lo::rgba_image m_ext_input;
-  lo::rgba_image m_cur_input;
-  lo::rgba_image m_prev_output;
+  // Render-thread state
+  std::unique_ptr<AsyncFrameProducer<AsyncJob, AsyncFrame>> m_producer;
+  PacedFrameConsumer m_consumer;
+  uint64_t m_submitted_key{0};
+  bool m_reported_no_control{false};
+  double m_last_tick_t{0.0};
+  rgba_image m_cur_input;
+  rgba_image m_prev_input;
+  rgba_image m_prev_output;
+  std::string m_build_status;
 };
 
 }
