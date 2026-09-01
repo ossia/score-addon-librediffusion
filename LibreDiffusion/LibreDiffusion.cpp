@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -361,6 +362,7 @@ StreamDiffusion::SetupKey StreamDiffusion::setupKey(const inputs_t& in)
   k.width = in.size.value.x;
   k.height = in.size.value.y;
   k.gpu = in.gpu.value;
+  k.seed = in.seed.value;
   k.workflow = in.workflow.value;
   k.cfg = in.cfg.value;
   k.klein_quality = in.klein_quality.value;
@@ -583,16 +585,22 @@ bool StreamDiffusion::buildJob(const inputs_t& in, AsyncJob& job)
   if(m_family == Family::Turbo)
     job.ehs = in.ehs.value;
 
-  struct
-  {
-    uint64_t ref, control, ehs;
-    float cn_scale, ip_scale, guidance, delta, lora;
-    int seed, w, h, exp;
-  } key{job.ref_hash,         job.control_hash,
-        hash_bytes(job.ehs.data(), job.ehs.size() * sizeof(float)),
-        job.controlnet_scale, job.ipadapter_scale, job.guidance, job.delta, job.lora_scale,
-        job.seed,             job.w,               job.h,        job.exp};
-  job.key = hash_bytes(&key, sizeof key);
+  // Everything that changes the output, widened to one type so there is no padding to hash.
+  const auto bits = [](float f) { return (uint64_t)std::bit_cast<uint32_t>(f); };
+  const uint64_t parts[] = {
+      job.ref_hash,
+      job.control_hash,
+      hash_bytes(job.ehs.data(), job.ehs.size() * sizeof(float)),
+      bits(job.controlnet_scale),
+      bits(job.ipadapter_scale),
+      bits(job.guidance),
+      bits(job.delta),
+      bits(job.lora_scale),
+      (uint64_t)(uint32_t)job.seed,
+      (uint64_t)job.w,
+      (uint64_t)job.h,
+      (uint64_t)job.exp};
+  job.key = hash_bytes(parts, sizeof parts);
   return true;
 }
 
@@ -626,11 +634,18 @@ void StreamDiffusion::renderTick(const inputs_t& in, bool triggered)
   const double dt = std::clamp(m_last_tick_t > 0.0 ? tnow - m_last_tick_t : 0.0, 0.0, 0.1);
   m_last_tick_t = tnow;
 
-  AsyncJob job;
-  const bool have_job = buildJob(in, job);
   const bool manual = in.manual.value;
   const bool fire = triggered;
   const int budget_sweeps = in.pacing.value == Smooth ? 3 : in.pacing.value == Fresh ? 2 : 1;
+
+  // Settle the producer first: (re)starting or stopping it bumps the generation the job carries.
+  if(in.async_mode.value)
+    ensureProducer(m_continuous && !manual);
+  else if(m_producer && m_producer->running())
+    stopProducer();
+
+  AsyncJob job;
+  const bool have_job = buildJob(in, job);
 
   auto adopt = [&](const AsyncFrame& frame) {
     m_consumer.on_keyframe(frame, tnow, budget_sweeps, m_gen);
@@ -647,7 +662,6 @@ void StreamDiffusion::renderTick(const inputs_t& in, bool triggered)
   bool have_frame = false;
   if(in.async_mode.value)
   {
-    ensureProducer(m_continuous && !manual);
     if(have_job && (manual ? fire : job.key != m_submitted_key))
     {
       m_submitted_key = job.key;
@@ -660,8 +674,6 @@ void StreamDiffusion::renderTick(const inputs_t& in, bool triggered)
   }
   else
   {
-    if(m_producer && m_producer->running())
-      stopProducer();
     // Render when the FIFO ran dry (every tick without interpolation, every 2^exp ticks with it).
     if(have_job && (manual ? fire : m_consumer.empty()))
     {
@@ -714,7 +726,7 @@ void StreamDiffusion::releaseFamily()
 {
   stopProducer();
   m_rife.reset();
-  m_rife_tried = false;
+  m_rife_failed_path.clear();
   m_model_dir.clear();
   m_w = m_h = 0;
 
@@ -743,10 +755,12 @@ bool StreamDiffusion::produceFrame(AsyncJob& job, AsyncFrame& out)
   out.h = job.h;
   out.gen = job.gen;
   out.rgba.assign(nbytes, 0);
+  const double t0 = now_s_steady();
   if(!renderFrame(job, out.rgba.data()))
     return false;
   if(job.exp > 0 && m_prev_key.size() == nbytes)
     interpolate(job, out);
+  out.produce_seconds = now_s_steady() - t0;
   m_prev_key = out.rgba;
   return true;
 }
@@ -793,8 +807,9 @@ bool StreamDiffusion::renderSD(const AsyncJob& job, unsigned char* out_rgba)
     {
       m_sd.set_ipadapter_image(pipe, job.control_rgba.data(), job.control_h, job.control_w);
       m_applied_control_hash = job.control_hash;
+      s.ipadapter_tokens = true;
     }
-    if(m_applied_control_hash == 0)
+    if(!s.ipadapter_tokens)
     {
       // An IP-variant UNet with no tokens at all: skip rather than run on nothing.
       if(!m_reported_no_style)
@@ -896,24 +911,24 @@ bool StreamDiffusion::renderTurbo(const AsyncJob& job, unsigned char* out_rgba)
 }
 
 // RIFE the sweep prev -> cur into out.sweep. The engine is loaded once per model/device; a bundle
-// without one (or an engine that cannot run this geometry) leaves the keyframe alone.
+// without one (or an engine that cannot run this geometry) leaves the keyframe alone. A plan that
+// appears later (e.g. built by the exporter) is picked up: the lookup is a stat per keyframe.
 void StreamDiffusion::interpolate(const AsyncJob& job, AsyncFrame& out)
 {
-  if(!m_rife && !m_rife_tried)
-  {
-    m_rife_tried = true;
-    const std::string path = rife_engine_path(m_model_dir);
-    if(!path.empty())
-      m_rife = SDRife{path.c_str(), m_device};
-    if(m_rife)
-      m_sd.rife_set_enabled(m_rife.get(), 1);
-    else
-      std::fprintf(
-          stderr, "StreamDiffusion: no usable rife_ifnet_fp16.plan for %s; interpolation off\n",
-          m_model_dir.c_str());
-  }
   if(!m_rife)
-    return;
+  {
+    const std::string path = rife_engine_path(m_model_dir);
+    if(path.empty() || path == m_rife_failed_path)
+      return;
+    m_rife = SDRife{path.c_str(), m_device};
+    if(!m_rife)
+    {
+      m_rife_failed_path = path;
+      std::fprintf(stderr, "StreamDiffusion: %s could not be loaded; interpolation off\n", path.c_str());
+      return;
+    }
+    m_sd.rife_set_enabled(m_rife.get(), 1);
+  }
 
   m_sd.rife_set_interpolation_exp(m_rife.get(), job.exp);
   const size_t needed = m_sd.rife_required_out_bytes(m_rife.get(), job.h, job.w);
@@ -989,7 +1004,7 @@ bool StreamDiffusion::configureSD(const inputs_t& in)
   }
   if(need_negative)
   {
-    if(!updatePromptEmbedding(in.negative_prompt.value, m_negative_embeddings)
+    if(!updatePromptEmbedding(in.negative_prompt.value, m_negative_embeddings, false)
        || m_sd.prepare_negative_embeds(
               pipe, m_negative_embeddings.embeddings, m_config_state.text_seq_len,
               m_config_state.text_hidden_dim)
@@ -1081,6 +1096,7 @@ bool StreamDiffusion::createSDPipeline(const inputs_t& in, std::vector<int> time
   s.ipadapter_scale = in.ipadapter_scale.value;
   s.lora_scale = -1.f;  // pushed again by the first frame: a new engine may have LoRA slots
   s.seeded = false;
+  s.ipadapter_tokens = false;
   s.do_add_noise = in.add_noise.value;
   s.delta = in.delta.value;
   s.text_seq_len = 77;
@@ -1211,11 +1227,9 @@ bool StreamDiffusion::createSDPipeline(const inputs_t& in, std::vector<int> time
     m_sd.config_set_temporal_params(config.get(), 1, in.add_noise.value ? 1 : 0, 0.8f, 0.78f, 1, 2);
 
   // ControlNet / IP-Adapter engines are loaded only at pipeline creation, not at reinit_buffers, so
-  // entering or leaving such a workflow needs a fresh pipeline.
-  const bool feature_pipeline
-      = isControlNet(in.workflow.value) || isIPAdapter(in.workflow.value)
-        || isControlNet(m_prev_inputs.workflow.value) || isIPAdapter(m_prev_inputs.workflow.value);
-  if(feature_pipeline && m_cached_engine->pipeline)
+  // a pipeline that has them, or needs them, cannot be reused across such a change.
+  const bool wants_features = isControlNet(in.workflow.value) || isIPAdapter(in.workflow.value);
+  if((wants_features || m_cached_engine->has_features) && m_cached_engine->pipeline)
   {
     delete m_cached_engine->pipeline;
     m_cached_engine->pipeline = nullptr;
@@ -1234,6 +1248,7 @@ bool StreamDiffusion::createSDPipeline(const inputs_t& in, std::vector<int> time
     m_cached_engine->pipeline = new SDPipeline{config.get()};
     if(!*m_cached_engine->pipeline)
       return false;
+    m_cached_engine->has_features = wants_features;
   }
 
   m_model_dir = model;
@@ -1241,13 +1256,14 @@ bool StreamDiffusion::createSDPipeline(const inputs_t& in, std::vector<int> time
   m_h = height;
   m_continuous = s.use_denoising_batch || pipeline_mode == MODE_TEMPORAL_V2V;
   m_rife.reset();
-  m_rife_tried = false;
+  m_rife_failed_path.clear();
   m_embeddings.clear();
   m_negative_embeddings.reset();
   return true;
 }
 
-bool StreamDiffusion::updatePromptEmbedding(const std::string& prompt, SDXLEmbeddings& embeddings)
+bool StreamDiffusion::updatePromptEmbedding(
+    const std::string& prompt, SDXLEmbeddings& embeddings, bool positive)
 {
   // The CLIP calls overwrite the device pointers with a fresh allocation; release what is held.
   embeddings.reset();
@@ -1260,8 +1276,10 @@ bool StreamDiffusion::updatePromptEmbedding(const std::string& prompt, SDXLEmbed
            &embeddings.embeddings, &embeddings.pooled_embeds, &embeddings.time_ids)
        != LIBREDIFFUSION_SUCCESS)
       return false;
-    return m_sd.prepare_sdxl_conditioning(pipe, embeddings.pooled_embeds, embeddings.time_ids)
-           == LIBREDIFFUSION_SUCCESS;
+    // The pooled conditioning is the positive prompt's; the negative one only feeds CFG.
+    return !positive
+           || m_sd.prepare_sdxl_conditioning(pipe, embeddings.pooled_embeds, embeddings.time_ids)
+                  == LIBREDIFFUSION_SUCCESS;
   }
   return m_sd.clip_compute_embeddings(
              m_cached_engine->clip1->get(), prompt.c_str(), m_config_state.clip_pad_token,
@@ -1282,7 +1300,7 @@ bool StreamDiffusion::updatePromptEmbeddings(
     {
       SDXLEmbeddings e;
       // blend_embeds does not null-check: a null device pointer there kills the CUDA context.
-      if(!updatePromptEmbedding(text, e) || !e.embeddings)
+      if(!updatePromptEmbedding(text, e, true) || !e.embeddings)
       {
         embeddings.clear();
         return false;
@@ -1300,7 +1318,7 @@ bool StreamDiffusion::updatePromptEmbeddings(
   }
 
   SDXLEmbeddings e;
-  if(!updatePromptEmbedding(prompt, e) || !e.embeddings)
+  if(!updatePromptEmbedding(prompt, e, true) || !e.embeddings)
     return false;
   embeddings.push_back(std::move(e));
   return m_sd.prepare_embeds(
@@ -1480,7 +1498,7 @@ bool StreamDiffusion::createKleinStream(const inputs_t& in)
   m_klein_mask_hash = 0;
   m_continuous = false;  // fixed-seed noise + cached reference: identical inputs, identical frame
   m_rife.reset();
-  m_rife_tried = false;
+  m_rife_failed_path.clear();
   return true;
 }
 
@@ -1516,7 +1534,7 @@ bool StreamDiffusion::configureTurbo(const inputs_t& in)
     m_model_dir = model;
     m_continuous = false;
     m_rife.reset();
-    m_rife_tried = false;
+    m_rife_failed_path.clear();
     // Prompt path: sd-turbo CLIP (1024-dim, pad 0); optional, the Embedding port overrides it.
     m_i2it_clip = SDClip{(model + "/clip.engine").c_str(), m_device};
     m_i2it_embeddings.reset();
