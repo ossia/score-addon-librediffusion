@@ -87,11 +87,18 @@ if(LRD_EMBED_EXPORTER)
       EXPECTED_HASH "SHA256=${LRD_UV_SHA256}"
       STATUS LRD_UV_STATUS)
     list(GET LRD_UV_STATUS 0 LRD_UV_STATUS_CODE)
-    if(NOT LRD_UV_STATUS_CODE EQUAL 0)
-      message(FATAL_ERROR "score-addon-librediffusion: could not download uv: ${LRD_UV_STATUS} (set -DLRD_EMBED_EXPORTER=OFF to skip)")
+    if(LRD_UV_STATUS_CODE EQUAL 0)
+      file(ARCHIVE_EXTRACT INPUT "${LRD_UV_ARCHIVE}" DESTINATION "${LRD_UV_DIR}")
+    else()
+      # An offline configure must not take the whole host build down with it.
+      message(WARNING "score-addon-librediffusion: could not download uv (${LRD_UV_STATUS}); building without the embedded exporter")
+      file(REMOVE "${LRD_UV_ARCHIVE}")
+      set(LRD_EMBED_EXPORTER OFF)
     endif()
-    file(ARCHIVE_EXTRACT INPUT "${LRD_UV_ARCHIVE}" DESTINATION "${LRD_UV_DIR}")
   endif()
+endif()
+
+if(LRD_EMBED_EXPORTER)
 
   # Manifest line: <relative path in the extracted exporter>|<source file>|<executable>
   get_filename_component(LRD_UV_NAME "${LRD_UV_BINARY}" NAME)

@@ -104,7 +104,11 @@ static std::string visible_device(int gpu)
   for(int i = 0; !list.empty(); ++i)
   {
     const auto comma = list.find(',');
-    const auto entry = list.substr(0, comma);
+    auto entry = list.substr(0, comma);
+    while(!entry.empty() && entry.front() == ' ')
+      entry.remove_prefix(1);
+    while(!entry.empty() && entry.back() == ' ')
+      entry.remove_suffix(1);
     if(i == gpu)
       return std::string{entry};
     if(comma == std::string_view::npos)

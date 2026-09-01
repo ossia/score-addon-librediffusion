@@ -20,6 +20,7 @@ struct CachedEngine
   SDPipeline* pipeline{};
   SDClip* clip1{};
   SDClip* clip2{};  // Only for SDXL
+  bool has_features{false};  // the pipeline was created with ControlNet / IP-Adapter engines
   bool in_use{false};
 
   CachedEngine();

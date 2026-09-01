@@ -39,6 +39,7 @@ struct SDConfigState
 
   int controlnet_index{-1};  // >= 0 when the workflow drives a ControlNet
   bool ipadapter_enabled{false};
+  bool ipadapter_tokens{false};  // a style image has been encoded into the pipeline
 
   // Live parameters as last pushed to the pipeline (by the producer thread, from the job).
   float controlnet_scale{0.6f};
@@ -306,6 +307,7 @@ private:
     int width{0};
     int height{0};
     int gpu{0};
+    int seed{0};  // baked into the klein stream at creation
     int8_t workflow{-1};
     int8_t cfg{-1};
     int8_t klein_quality{-1};
@@ -331,7 +333,7 @@ private:
   bool configure(const inputs_t& in);
   bool configureSD(const inputs_t& in);
   bool createSDPipeline(const inputs_t& in, std::vector<int> timestep_indices);
-  bool updatePromptEmbedding(const std::string& prompt, SDXLEmbeddings& embeddings);
+  bool updatePromptEmbedding(const std::string& prompt, SDXLEmbeddings& embeddings, bool positive);
   bool updatePromptEmbeddings(const std::string& prompt, std::vector<SDXLEmbeddings>& embeddings);
   bool updateScheduler(const std::string& timestep_str);
   bool configureKlein(const inputs_t& in);
@@ -387,7 +389,7 @@ private:
 
   // Producer-thread state (the render thread touches it only while the producer is stopped).
   SDRife m_rife;
-  bool m_rife_tried{false};
+  std::string m_rife_failed_path;  // an engine that failed to load; retried only if the path changes
   std::vector<unsigned char> m_prev_key;  // previous keyframe, interpolated from
   uint64_t m_applied_ref_hash{0};         // klein: reference currently VAE-encoded
   uint64_t m_applied_control_hash{0};     // SD: control map / style image currently uploaded

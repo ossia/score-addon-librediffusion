@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -49,7 +50,8 @@ struct AsyncFrame
   std::vector<unsigned char> sweep;
   int sweep_n{0};
   int w{0}, h{0};
-  uint64_t gen{0};  // configuration generation; the consumer drops frames from a stale one
+  uint64_t gen{0};           // configuration generation; the consumer drops frames from a stale one
+  double produce_seconds{0}; // wall time spent producing it (0 = unknown -> measured from arrivals)
 };
 
 // Everything a frame needs, captured on the render thread.
@@ -120,8 +122,10 @@ public:
     m_job_cv.notify_all();
     m_thread.join();
     {
-      Job drop;
-      while(m_job_tb.consume(drop)) { }
+      Job drop_job;
+      while(m_job_tb.consume(drop_job)) { }
+      Frame drop_frame;
+      while(m_frame_tb.consume(drop_frame)) { }
     }
     m_job_ready.store(false, std::memory_order_release);
     m_busy.store(false, std::memory_order_release);
@@ -199,6 +203,8 @@ private:
 
       if(!m_continuous)
         have_job = false;
+      else if(!ok)  // a pipeline that keeps failing must not spin at full speed
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   }
 
@@ -231,15 +237,16 @@ public:
     if(nbytes == 0)
       return;
 
+    // The production rate is what the pipeline can sustain: the time spent producing the frame
+    // when known, else the arrival gap (which includes idle time between sporadic inputs).
     const int n = std::max(1, fresh.sweep_n);
-    if(m_last_kf_t > 0.0)
+    double period = fresh.produce_seconds;
+    if(period <= 0.0 && m_last_kf_t > 0.0)
+      period = tnow - m_last_kf_t;
+    if(period > 1e-3 && period < 5.0)
     {
-      const double gap = tnow - m_last_kf_t;
-      if(gap > 1e-3 && gap < 5.0)
-      {
-        const double inst_rate = (double)n / gap;
-        m_prod_rate = (m_prod_rate <= 0.0) ? inst_rate : 0.8 * m_prod_rate + 0.2 * inst_rate;
-      }
+      const double inst_rate = (double)n / period;
+      m_prod_rate = (m_prod_rate <= 0.0) ? inst_rate : 0.8 * m_prod_rate + 0.2 * inst_rate;
     }
     m_last_kf_t = tnow;
 
