@@ -1,11 +1,11 @@
 {
-  "src": "<url to the .zip file created by the release script>",
+  "src": "https://github.com/ossia/score-addon-librediffusion/releases/latest/download/score-addon-librediffusion.zip",
   "name": "LibreDiffusion",
   "raw_name": "score-addon-librediffusion",
   "version": "1.0",
   "kind": "addon",
-  "short": "LibreDiffusion",
-  "long": "LibreDiffusion",
-  "small": "https://raw.githubusercontent.com/OSSIA/score-addon-tutorial/master/Deployment/icon.png",
-  "key": "0d0549bf-8e07-4e3c-a67a-00bb6bef5526"
+  "short": "Real-time diffusion (StreamDiffusion) on TensorRT",
+  "long": "Real-time SD1.5 / SD-turbo / SDXL / StreamV2V / FLUX.2-klein / img2img-turbo image generation through librediffusion, with an embedded engine builder.",
+  "small": "https://raw.githubusercontent.com/ossia/score-addon-librediffusion/master/icon.png",
+  "key": "b3fe4d80-0a1a-4b23-8cd2-b82472f9f91f"
 }

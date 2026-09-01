@@ -5,6 +5,7 @@ Port ids come from LibreDiffusion.hpp's inputs_t order under Crousti/ProcessMode
 `int inlet = 0` counter (verified by the portids probe): the two texture inlets and the two plain
 value inlets (Embedding, Trigger) consume 0..3, so the first saved control (Workflow) is 4.
 The 2026-06-07 presets predate the Embedding and LoRA-scale ports and are off by one/two throughout.
+Ports 26.. (GPU, the engine-builder controls and its Build impulse) are left at their defaults.
 
 Every preset is checked against the bundle's real TensorRT profile (batch/resolution parsed from
 /media/data2/lrd-engines/index.json's label, or the exporter's bundle.json) before it is written, so
@@ -24,7 +25,8 @@ INDEX = "/media/data2/lrd-engines/index.json"
 P = dict(workflow=4, prompt=5, negative=6, engines=7, seed=8, guidance=9, timesteps=10,
          resolution=11, cfg=12, add_noise=13, denoise_batch=14, manual=15, delta=16,
          feed_prev_in=17, feed_prev_out=18, cn_scale=19, ip_scale=20, lora_scale=21,
-         klein_quality=22, rife_exp=23, async_=24, pacing=25)
+         klein_quality=22, rife_exp=23, async_=24, pacing=25, gpu=26, python_cache=27,
+         build_folder=28, build_options=29, build=30)
 
 # Workflow enum (LibreDiffusion.hpp)
 (SD_T2I, SD_I2I, SD_T2I_CN, SD_I2I_CN, SD_T2I_IP, SD_I2I_IP, TURBO_T2I, TURBO_I2I,
