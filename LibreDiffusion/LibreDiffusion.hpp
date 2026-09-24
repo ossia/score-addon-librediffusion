@@ -2,8 +2,7 @@
 #include "AsyncFrameProducer.hpp"
 #include "librediffusion_loader.hpp"
 
-// triple_buffer pulled in transitively via AsyncFrameProducer.hpp above, which
-// already selects the ossia header or the vendored standalone copy.
+// The triple buffer comes with AsyncFrameProducer.hpp above.
 
 #include "Image.hpp"
 
