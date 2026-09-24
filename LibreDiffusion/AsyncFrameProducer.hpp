@@ -28,10 +28,10 @@
 
 // triple_buffer is the lock-free producer->consumer hand-off. Always use the
 // vendored copy: it is API-compatible with ossia::triple_buffer but self-
-// contained, so this compiles in every mode -- standalone (no libossia) and,
-// crucially, against the score SDK, whose bundled ossia/detail/triple_buffer.hpp
-// is an older revision that misses <utility> and fails to build. No score
-// header included by this object pulls the ossia copy, so there is no clash.
+// contained, so this compiles in every mode -- standalone (no libossia) and
+// against the score SDK, whose bundled ossia/detail/triple_buffer.hpp may be an
+// older revision that misses <utility>. It lives in its own namespace, as
+// score's headers may include the ossia one too.
 #include "compat/triple_buffer.hpp"
 
 #include <algorithm>
@@ -219,8 +219,8 @@ private:
   produce_fn m_produce;
   bool m_rerun_idle{true};
   std::jthread m_thread;
-  ossia::triple_buffer<Frame> m_frame_tb;  // producer -> render (frames out)
-  ossia::triple_buffer<Job> m_job_tb;      // render -> producer (jobs in)
+  librediffusion::compat::triple_buffer<Frame> m_frame_tb;  // producer -> render (frames out)
+  librediffusion::compat::triple_buffer<Job> m_job_tb;      // render -> producer (jobs in)
   std::mutex m_wake_mtx;                    // companion for the cv only (guards no data)
   std::condition_variable m_job_cv;         // wake the idle worker when a job is submitted
   std::atomic<bool> m_job_ready{false};     // lost-wakeup-safe predicate

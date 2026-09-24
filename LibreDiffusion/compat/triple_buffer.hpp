@@ -1,8 +1,8 @@
 #pragma once
 // Vendored, self-contained copy of ossia::triple_buffer (from libossia,
-// ossia/detail/triple_buffer.hpp). Used only for standalone builds, where
-// libossia is not on the include path; the score build picks the real header
-// via __has_include in AsyncFrameProducer.hpp. Keep API-compatible with ossia.
+// ossia/detail/triple_buffer.hpp), in this add-on's own namespace: it builds
+// standalone and against any score SDK, and never clashes with the ossia one,
+// which score's own headers include.
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace ossia
+namespace librediffusion::compat
 {
 
 template <typename T>
