@@ -83,4 +83,8 @@ avnd_addon_object(
     LibreDiffusion/EngineCache.hpp
     LibreDiffusion/EngineCache.cpp)
 
+if(COMMAND score_register_license)
+  score_register_license(librediffusion URL "https://github.com/jcelerier/librediffusion" FILES "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/librediffusion/LICENSE")
+endif()
+
 avnd_addon_finalize(NAME score_addon_librediffusion UUID b3fe4d80-0a1a-4b23-8cd2-b82472f9f91f VERSION 1)
