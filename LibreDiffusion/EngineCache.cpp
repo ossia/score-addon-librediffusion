@@ -19,6 +19,7 @@ CachedEngine::CachedEngine(CachedEngine&& other) noexcept
     , pipeline{other.pipeline}
     , clip1{other.clip1}
     , clip2{other.clip2}
+    , has_features{other.has_features}
     , in_use{other.in_use}
 {
   other.pipeline = nullptr;
@@ -40,6 +41,7 @@ CachedEngine& CachedEngine::operator=(CachedEngine&& other) noexcept
     pipeline = other.pipeline;
     clip1 = other.clip1;
     clip2 = other.clip2;
+    has_features = other.has_features;
     in_use = other.in_use;
 
     other.pipeline = nullptr;
