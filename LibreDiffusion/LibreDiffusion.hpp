@@ -35,6 +35,8 @@ struct SDConfigState
   int text_hidden_dim{768};
   int clip_pad_token{49407};
   int pooled_embedding_dim{1280};
+  // bundle.json unet_timestep_scale (NitroFusion): see streamdiffusion::build_schedule.
+  float unet_timestep_scale{1.f};
   std::vector<int> timestep_indices;
 
   int controlnet_index{-1};  // >= 0 when the workflow drives a ControlNet

@@ -256,6 +256,50 @@ def build():
                  preset(f"{name} img2img", eng, SDXL_I2I, steps=steps, res=res, mode="i2i",
                         sched=sch, denoise_batch=db, is_async=slow)]
 
+    # ---- 1-2 step SDXL UNet replacements (train-lora.py --unet, bench/build_fast_models.sh). One
+    # 1024 b1-2 bundle each, so every one runs at 1 and at 2 steps. NitroFusion's shifted timestep is
+    # in its bundle.json (unet_timestep_scale), not in the preset. DMD2's 1-step UNet only ever saw
+    # pure noise at t=399: it is txt2img-only (img2img input comes out as a soft blur), from index 30.
+    F = "/media/data2/lrd-engines-fast"
+    made += [preset("SDXL DMD2 1step-UNet txt2img", f"{F}/dmd2-sdxl-1step", SDXL_T2I, steps=1,
+                    res=(1024, 1024), mode="t2i", timesteps="30", is_async=True)]
+    for name, eng in [
+        ("SDXL DMD2 4step-UNet", f"{F}/dmd2-sdxl-4step"),
+        ("SDXL NitroSD Realism", f"{F}/nitrosd-realism"),
+        ("SDXL NitroSD Vibrant", f"{F}/nitrosd-vibrant"),
+    ]:
+        for steps in (1, 2):
+            made += [preset(f"{name} {steps}step txt2img", eng, SDXL_T2I, steps=steps,
+                            res=(1024, 1024), mode="t2i", denoise_batch=steps > 1, is_async=True),
+                     preset(f"{name} {steps}step img2img", eng, SDXL_I2I, steps=steps,
+                            res=(1024, 1024), mode="i2i", denoise_batch=steps > 1, is_async=True)]
+
+    # ---- DMD2 at its native 4 steps: only txt2img on the trained schedule (999/759/499/259) is sharp;
+    # img2img on more than 2 late steps goes soft, so its video presets stay at 2 steps. Needs the
+    # batch-4 bundle (denoise-batch runs the 4 steps as one batch-4 UNet call).
+    made += [preset("SDXL DMD2 4step-UNet 4step txt2img", f"{F}/dmd2-sdxl-4step-b4", SDXL_T2I,
+                    steps=4, res=(1024, 1024), mode="t2i", timesteps="0, 12, 25, 37",
+                    denoise_batch=True, is_async=True)]
+
+    # ---- RIFE between diffused frames (the producer interpolates prev -> cur; async only). The
+    # factors put the displayed rate at ~20-45 fps on a 4090 at 1024 (sd_video_harness --rife-exp):
+    # turbo 1 step 12.6 diffused / 25 displayed (x2); turbo 2 steps 7.8 / 31 (x4); DMD2 2 steps
+    # 8.0 / 32 (x4); DMD2 4 steps 4.8 / 19 (x4). The engine is found next to the bundle or in its
+    # parent folder (one rife_ifnet_fp16.plan per GPU in F).
+    for name, eng, steps, exp, t2i_ts, i2i_ts in [
+        ("SDXL Turbo 1step RIFE x2", f"{F}/sdxl-turbo", 1, 1, None, None),
+        ("SDXL Turbo 2step RIFE x4", f"{F}/sdxl-turbo", 2, 2, None, None),
+        ("SDXL DMD2 4step-UNet 2step RIFE x4", f"{F}/dmd2-sdxl-4step", 2, 2, None, None),
+        ("SDXL DMD2 4step-UNet 4step RIFE x4", f"{F}/dmd2-sdxl-4step-b4", 4, 2, "0, 12, 25, 37", False),
+    ]:
+        made += [preset(f"{name} txt2img", eng, SDXL_T2I, steps=steps, res=(1024, 1024),
+                        mode="t2i", timesteps=t2i_ts, denoise_batch=steps > 1, rife_exp=exp,
+                        is_async=True)]
+        if i2i_ts is not False:
+            made += [preset(f"{name} img2img", eng, SDXL_I2I, steps=steps, res=(1024, 1024),
+                            mode="i2i", timesteps=i2i_ts, denoise_batch=steps > 1, rife_exp=exp,
+                            is_async=True)]
+
     # ---- ControlNet. Preprocessing is EXTERNAL: feed an already-extracted canny/depth/pose/softedge
     # map into "Control / Style". txt2img+CN reinvents from the structure, img2img+CN restyles the
     # actual footage.
@@ -307,6 +351,17 @@ def build():
                     res=(576, 320), mode="i2i", timesteps="15, 25", prompt_key="klein",
                     klein_quality=1, rife_exp=2, is_async=True, check=False)]
 
+    # ---- klein + the SANA-Sprint LoRA (fused at export): good at 1 step, best at 2. "1.0" is the
+    # one-step sigma list; the SD-style default keeps the native 2-step schedule.
+    KS = "/media/data2/lrd-engines-fast/klein-sprint"
+    for steps, ts in ((1, "1.0"), (2, "15, 25")):
+        made += [preset(f"FLUX2 Klein Sprint {steps}step txt2img", KS, KLEIN_T2I, steps=1,
+                        res=(320, 576), mode="t2i", timesteps=ts, prompt_key="klein",
+                        klein_quality=1, rife_exp=2, is_async=True, check=False),
+                 preset(f"FLUX2 Klein Sprint {steps}step img2img", KS, KLEIN_I2I, steps=1,
+                        res=(320, 576), mode="i2i", timesteps=ts, prompt_key="klein",
+                        klein_quality=1, rife_exp=2, is_async=True, check=False)]
+
     # ---- img2img-turbo (skip-VAE pix2pix-turbo): geometry and step count come from the engine.
     for name, eng in [("img2img-turbo edge2image", "/media/data1/img2img-turbo/bundle-traintest"),
                       ("img2img-turbo sketch2image", "/media/data1/img2img-turbo/bundle-sketch")]:
@@ -322,17 +377,33 @@ def build():
 
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Regenerate the StreamDiffusion .scp presets.")
+    ap.add_argument("--out", default=OUT, help=f"preset folder (default {OUT})")
+    ap.add_argument("--only", metavar="REGEX",
+                    help="write only the presets whose name matches, leaving every other file in "
+                         "--out alone (default: wipe --out and write them all)")
+    args = ap.parse_args()
+    OUT = args.out
     if not os.path.isdir(OUT):
         sys.exit(f"preset dir not found: {OUT}")
-    backup = OUT + ".bak-2026-07-26"
-    if not os.path.exists(backup):
-        shutil.copytree(OUT, backup)
-        print(f"backed up existing presets -> {backup}")
-    for f in os.listdir(OUT):
-        if f.endswith(".scp"):
-            os.remove(os.path.join(OUT, f))
+    if args.only:
+        only = re.compile(args.only)
+        _preset = preset
+        def preset(name, *a, **kw):  # noqa: F811 -- build() looks it up at call time
+            return _preset(name, *a, **kw) if only.search(name) else None
+    else:
+        backup = OUT + ".bak-2026-07-26"
+        if not os.path.exists(backup):
+            shutil.copytree(OUT, backup)
+            print(f"backed up existing presets -> {backup}")
+        for f in os.listdir(OUT):
+            if f.endswith(".scp"):
+                os.remove(os.path.join(OUT, f))
     made = build()
-    print(f"\nwrote {len(made)} presets")
+    for m in made:
+        print("  wrote", m)
+    print(f"\nwrote {len(made)} presets to {OUT}")
     if problems:
         print(f"\n{len(problems)} skipped / flagged:")
         for p in problems:

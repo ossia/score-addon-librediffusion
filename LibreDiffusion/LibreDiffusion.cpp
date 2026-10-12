@@ -11,6 +11,8 @@
 #include "schedulers/lcm_dreamshaper_v7.hpp"
 #include "schedulers/sd-turbo.hpp"
 #include "schedulers/sdxl-turbo.hpp"
+#include "schedulers/schedule.hpp"
+#include "bundle_manifest.hpp"
 
 #include <boost/container/small_vector.hpp>
 
@@ -200,37 +202,6 @@ static std::vector<float> get_sigmas(const std::string& s)
     if(!(v > 0.f && v <= 1.f))
       return {};
   return out;
-}
-
-// Cross-attention width declared by a bundle's manifest, or 0 when there is no usable manifest.
-// SD1.5 encodes to 768, SD2.1 to 1024, and the workflow enum cannot tell them apart. A scan and
-// not a JSON parse: one integer out of a file we generate ourselves.
-static int bundle_embedding_dim(const std::string& model_dir)
-{
-  std::ifstream f{model_dir + "/bundle.json", std::ios::binary};
-  if(!f)
-    return 0;
-  const std::string text{std::istreambuf_iterator<char>{f}, std::istreambuf_iterator<char>{}};
-
-  const auto key = text.find("\"embedding_dim\"");
-  if(key == std::string::npos)
-    return 0;
-  auto p = text.find(':', key);
-  if(p == std::string::npos)
-    return 0;
-  ++p;
-  while(p < text.size() && (text[p] == ' ' || text[p] == '\t'))
-    ++p;
-  int dim = 0;
-  const auto begin = p;
-  while(p < text.size() && text[p] >= '0' && text[p] <= '9')
-  {
-    dim = dim * 10 + (text[p] - '0');
-    if(dim > 65536)
-      return 0;
-    ++p;
-  }
-  return p > begin ? dim : 0;
 }
 
 // Read 128 fp32 (a klein VAE batch-norm constant) from <path>.
@@ -1099,6 +1070,7 @@ bool StreamDiffusion::createSDPipeline(const inputs_t& in, std::vector<int> time
   s.ipadapter_tokens = false;
   s.do_add_noise = in.add_noise.value;
   s.delta = in.delta.value;
+  s.unet_timestep_scale = librediffusion::bundle_unet_timestep_scale(model);
   s.text_seq_len = 77;
   s.pooled_embedding_dim = 1280;
   switch(model_type)
@@ -1141,7 +1113,7 @@ bool StreamDiffusion::createSDPipeline(const inputs_t& in, std::vector<int> time
       s.text_hidden_dim = 768;
       s.clip_pad_token = 49407;
       // SD2.1 shares this path but encodes to 1024: take the manifest's width when it declares one.
-      if(const int dim = bundle_embedding_dim(model); dim > 0)
+      if(const int dim = librediffusion::bundle_embedding_dim(model); dim > 0)
         s.text_hidden_dim = dim;
       break;
   }
@@ -1175,10 +1147,14 @@ bool StreamDiffusion::createSDPipeline(const inputs_t& in, std::vector<int> time
   m_sd.config_set_add_noise(config.get(), s.do_add_noise ? 1 : 0);
   m_sd.config_set_denoising_batch(config.get(), s.use_denoising_batch ? 1 : 0);
   m_sd.config_set_cfg_type(config.get(), static_cast<librediffusion_cfg_type_t>(s.cfg_type));
-  // CUDA graph: capturable only for one step, cfg-none, non-V2V (the library re-gates identically).
+  // CUDA graph: capture the per-frame denoise (one step, or several with denoising batch) for
+  // cfg-none, non-V2V configs; the library re-gates identically and falls back to per-call enqueue
+  // otherwise. Bit-identical output; ~+15% at SD-Turbo 512 1-step, ~+10% at SD1.5 2-step, a few %
+  // at SDXL 1024.
   m_sd.config_set_cuda_graph(
       config.get(),
-      (s.denoising_steps == 1 && s.cfg_type == SD_CFG_NONE && pipeline_mode != MODE_TEMPORAL_V2V)
+      ((s.denoising_steps == 1 || s.use_denoising_batch) && s.cfg_type == SD_CFG_NONE
+       && pipeline_mode != MODE_TEMPORAL_V2V)
           ? 1
           : 0);
   if(!accepted(
@@ -1356,26 +1332,38 @@ bool StreamDiffusion::updateScheduler(const std::string& timestep_str)
       break;
   }
 
-  std::vector<float> timesteps, alpha, beta, c_skip, c_out;
-  for(int idx : m_config_state.timestep_indices)
-  {
-    if(idx < 0 || idx >= std::ssize(table_params) || idx >= std::ssize(table_timesteps))
-      continue;
-    timesteps.push_back(static_cast<float>(table_timesteps[idx]));
-    alpha.push_back(table_params[idx].alpha_prod_t_sqrt);
-    beta.push_back(table_params[idx].beta_prod_t_sqrt);
-    c_skip.push_back(table_params[idx].c_skip);
-    c_out.push_back(table_params[idx].c_out);
-  }
-  if(timesteps.empty())
+  ScheduleArrays schedule;
+  build_schedule(
+      table_timesteps, table_params, m_config_state.timestep_indices,
+      m_config_state.unet_timestep_scale, schedule);
+  if(schedule.size() == 0)
     return false;
 
-  const auto err = m_sd.prepare_scheduler(
-      m_cached_engine->pipeline->get(), timesteps.data(), alpha.data(), beta.data(), c_skip.data(),
-      c_out.data(), timesteps.size());
-  if(err != LIBREDIFFUSION_SUCCESS)
+  auto* pipe = m_cached_engine->pipeline->get();
+  if(const auto err = m_sd.prepare_scheduler(
+         pipe, schedule.timesteps.data(), schedule.alpha_prod_t_sqrt.data(),
+         schedule.beta_prod_t_sqrt.data(), schedule.c_skip.data(), schedule.c_out.data(),
+         schedule.size());
+     err != LIBREDIFFUSION_SUCCESS)
+  {
     std::fprintf(stderr, "StreamDiffusion: prepare_scheduler failed (%d)\n", (int)err);
-  return err == LIBREDIFFUSION_SUCCESS;
+    return false;
+  }
+
+  // Shifted-timestep bundles (unet_timestep_scale != 1, NitroFusion) noise their input at the
+  // unshifted t.
+  if(schedule.has_noise_schedule())
+  {
+    if(const auto err = m_sd.prepare_noise_schedule(
+           pipe, schedule.noise_alpha_prod_t_sqrt.data(), schedule.noise_beta_prod_t_sqrt.data(),
+           schedule.size());
+       err != LIBREDIFFUSION_SUCCESS)
+    {
+      std::fprintf(stderr, "StreamDiffusion: prepare_noise_schedule failed (%d)\n", (int)err);
+      return false;
+    }
+  }
+  return true;
 }
 
 // -------------------------------------------------------------------------------------------------
