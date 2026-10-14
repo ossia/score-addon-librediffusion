@@ -84,9 +84,16 @@ if(LRD_EMBED_EXPORTER)
     file(DOWNLOAD
       "https://releases.astral.sh/github/uv/releases/download/${LRD_UV_VERSION}/${LRD_UV_ASSET}"
       "${LRD_UV_ARCHIVE}"
-      EXPECTED_HASH "SHA256=${LRD_UV_SHA256}"
       STATUS LRD_UV_STATUS)
     list(GET LRD_UV_STATUS 0 LRD_UV_STATUS_CODE)
+    # EXPECTED_HASH would turn a failed download into a hard configure error
+    if(LRD_UV_STATUS_CODE EQUAL 0)
+      file(SHA256 "${LRD_UV_ARCHIVE}" LRD_UV_ACTUAL_SHA256)
+      if(NOT LRD_UV_ACTUAL_SHA256 STREQUAL LRD_UV_SHA256)
+        set(LRD_UV_STATUS_CODE 1)
+        set(LRD_UV_STATUS "1;\"SHA256 mismatch: ${LRD_UV_ACTUAL_SHA256}\"")
+      endif()
+    endif()
     if(LRD_UV_STATUS_CODE EQUAL 0)
       file(ARCHIVE_EXTRACT INPUT "${LRD_UV_ARCHIVE}" DESTINATION "${LRD_UV_DIR}")
     else()
