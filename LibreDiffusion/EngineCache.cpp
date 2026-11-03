@@ -53,8 +53,12 @@ CachedEngine& CachedEngine::operator=(CachedEngine&& other) noexcept
 
 EngineCache& EngineCache::instance()
 {
-  static EngineCache cache;
-  return cache;
+  // Never destroyed. The first call happens before any CUDA call, so a function-local static
+  // would be destroyed after the CUDA runtime's own exit-time teardown and its pipelines would
+  // then release their streams and TensorRT contexts into a dead driver (segfault on quit). The
+  // process exit reclaims the device memory anyway.
+  static EngineCache* const cache = new EngineCache;
+  return *cache;
 }
 
 CachedEngine* EngineCache::acquire(
