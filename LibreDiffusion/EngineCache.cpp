@@ -1,6 +1,9 @@
 #include "EngineCache.hpp"
 #include "LibreDiffusion.hpp"
 
+#include <algorithm>
+#include <cstdio>
+
 namespace lo
 {
 CachedEngine::CachedEngine() = default;
@@ -94,6 +97,28 @@ void EngineCache::release(CachedEngine* engine)
 
   std::lock_guard lock{m_mutex};
   engine->in_use = false;
+  // Most recently parked last.
+  auto it = std::find_if(m_engines.begin(), m_engines.end(), [&](auto& e) { return e.get() == engine; });
+  if (it != m_engines.end())
+    std::rotate(it, it + 1, m_engines.end());
+}
+
+bool EngineCache::evict_parked(int device)
+{
+  std::unique_ptr<CachedEngine> dropped;
+  {
+    std::lock_guard lock{m_mutex};
+    auto it = std::find_if(m_engines.begin(), m_engines.end(), [&](auto& e) {
+      return !e->in_use && e->device == device;
+    });
+    if (it == m_engines.end())
+      return false;
+    dropped = std::move(*it);
+    m_engines.erase(it);
+  }
+  std::fprintf(stderr, "StreamDiffusion: out of device memory, unloading %s\n",
+               dropped->model_path.c_str());
+  return true;
 }
 
 void EngineCache::clear()
