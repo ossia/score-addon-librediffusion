@@ -214,6 +214,17 @@ static bool read_bn_file(const std::string& path, std::array<float, 128>& out)
   return f.gcount() == static_cast<std::streamsize>(128 * sizeof(float));
 }
 
+// A load that ran out of device memory is retried after freeing parked pipelines, oldest first.
+template <typename Create>
+static bool create_evicting(int device, Create&& create)
+{
+  while(!create())
+    if(lib().last_create_error() != LIBREDIFFUSION_ERROR_OUT_OF_MEMORY
+       || !EngineCache::instance().evict_parked(device))
+      return false;
+  return true;
+}
+
 // The RIFE engine for a bundle: its own, else one shared by the bundles of the parent folder.
 static std::string rife_engine_path(const std::string& model_dir)
 {
@@ -314,8 +325,6 @@ StreamDiffusion::~StreamDiffusion()
 {
   // The producer touches every pipeline handle: join it before anything is destroyed.
   releaseFamily();
-  if(m_cached_engine)
-    EngineCache::instance().release(m_cached_engine);
 }
 
 bool StreamDiffusion::is_available() noexcept
@@ -417,17 +426,7 @@ void StreamDiffusion::operator()()
   {
     releaseFamily();
     m_family = family;
-    if(in.gpu.value != m_device)
-    {
-      // The cached SD engine is bound to the old device; hand it back and let configureSD acquire
-      // or build one for the new device.
-      m_device = in.gpu.value;
-      if(m_cached_engine)
-      {
-        EngineCache::instance().release(m_cached_engine);
-        m_cached_engine = nullptr;
-      }
-    }
+    m_device = in.gpu.value;
   }
 
   if(in.model.value.empty())
@@ -701,6 +700,12 @@ void StreamDiffusion::releaseFamily()
   m_model_dir.clear();
   m_w = m_h = 0;
 
+  if(m_cached_engine)
+  {
+    EngineCache::instance().release(m_cached_engine);
+    m_cached_engine = nullptr;
+  }
+
   m_klein_stream.reset();
   m_klein_quality = -1;
   m_klein_seed = 0;
@@ -891,8 +896,10 @@ void StreamDiffusion::interpolate(const AsyncJob& job, AsyncFrame& out)
     const std::string path = rife_engine_path(m_model_dir);
     if(path.empty() || path == m_rife_failed_path)
       return;
-    m_rife = SDRife{path.c_str(), m_device};
-    if(!m_rife)
+    if(!create_evicting(m_device, [&] {
+         m_rife = SDRife{path.c_str(), m_device};
+         return bool(m_rife);
+       }))
     {
       m_rife_failed_path = path;
       std::fprintf(stderr, "StreamDiffusion: %s could not be loaded; interpolation off\n", path.c_str());
@@ -1032,8 +1039,11 @@ bool StreamDiffusion::createSDPipeline(const inputs_t& in, std::vector<int> time
       engine->model_path = model;
       engine->pipeline_mode = pipeline_mode;
       engine->device = m_device;
-      engine->clip1 = new SDClip{(model + "/clip.engine").c_str(), m_device};
-      if(!*engine->clip1)
+      if(!create_evicting(m_device, [&] {
+           delete engine->clip1;
+           engine->clip1 = new SDClip{(model + "/clip.engine").c_str(), m_device};
+           return bool(*engine->clip1);
+         }))
         return false;
       m_cached_engine = EngineCache::instance().store(std::move(engine));
     }
@@ -1042,15 +1052,17 @@ bool StreamDiffusion::createSDPipeline(const inputs_t& in, std::vector<int> time
   // workflow lacks the clip2 an SDXL workflow needs; build it on demand.
   if(model_type == MODEL_SDXL_TURBO && !m_cached_engine->clip2)
   {
-    auto* clip2 = new SDClip{(model + "/clip2.engine").c_str(), m_device};
-    if(!*clip2)
+    std::unique_ptr<SDClip> clip2;
+    if(!create_evicting(m_device, [&] {
+         clip2 = std::make_unique<SDClip>((model + "/clip2.engine").c_str(), m_device);
+         return bool(*clip2);
+       }))
     {
       std::fprintf(stderr, "StreamDiffusion: SDXL workflow but %s/clip2.engine could not be loaded\n",
                    model.c_str());
-      delete clip2;
       return false;
     }
-    m_cached_engine->clip2 = clip2;
+    m_cached_engine->clip2 = clip2.release();
   }
 
   SDConfigState& s = m_config_state;
@@ -1220,9 +1232,11 @@ bool StreamDiffusion::createSDPipeline(const inputs_t& in, std::vector<int> time
   }
   else
   {
-    delete m_cached_engine->pipeline;
-    m_cached_engine->pipeline = new SDPipeline{config.get()};
-    if(!*m_cached_engine->pipeline)
+    if(!create_evicting(m_device, [&] {
+         delete m_cached_engine->pipeline;
+         m_cached_engine->pipeline = new SDPipeline{config.get()};
+         return bool(*m_cached_engine->pipeline);
+       }))
       return false;
     m_cached_engine->has_features = wants_features;
   }
@@ -1464,11 +1478,13 @@ bool StreamDiffusion::createKleinStream(const inputs_t& in)
       = model
         + (in.klein_quality.value == Speed ? "/transformer_fp8_calib.plan"
                                            : "/transformer_bf16.plan");
-  m_klein_stream = SDFluxStream{
-      transformer.c_str(), (model + "/qwen3_encoder_bf16.plan").c_str(),
-      (model + "/vae_decoder_bf16.plan").c_str(), (model + "/vae_encoder_bf16.plan").c_str(),
-      (model + "/tokenizer.json").c_str(), h / 16, w / 16, klein_seed(in.seed.value), m_device};
-  if(!m_klein_stream)
+  if(!create_evicting(m_device, [&] {
+       m_klein_stream = SDFluxStream{
+           transformer.c_str(), (model + "/qwen3_encoder_bf16.plan").c_str(),
+           (model + "/vae_decoder_bf16.plan").c_str(), (model + "/vae_encoder_bf16.plan").c_str(),
+           (model + "/tokenizer.json").c_str(), h / 16, w / 16, klein_seed(in.seed.value), m_device};
+       return bool(m_klein_stream);
+     }))
   {
     std::fprintf(stderr, "FLUX.2-klein: failed to create the stream pipeline\n");
     return false;
@@ -1500,10 +1516,12 @@ bool StreamDiffusion::configureTurbo(const inputs_t& in)
   {
     stopProducer();
     m_i2it.reset();
-    m_i2it = SDImg2ImgTurbo{
-        (model + "/unet.engine").c_str(), (model + "/vae_encoder.engine").c_str(),
-        (model + "/vae_decoder.engine").c_str(), m_device};
-    if(!m_i2it)
+    if(!create_evicting(m_device, [&] {
+         m_i2it = SDImg2ImgTurbo{
+             (model + "/unet.engine").c_str(), (model + "/vae_encoder.engine").c_str(),
+             (model + "/vae_decoder.engine").c_str(), m_device};
+         return bool(m_i2it);
+       }))
     {
       std::fprintf(stderr, "img2img-turbo: create failed for %s\n", model.c_str());
       return false;
