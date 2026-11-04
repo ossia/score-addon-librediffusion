@@ -38,7 +38,10 @@ public:
 
   CachedEngine* acquire(const std::string& model_path, int pipeline_mode, int device);
   CachedEngine* store(std::unique_ptr<CachedEngine> engine);
+  // Parks the entry for reuse.
   void release(CachedEngine* engine);
+  // Destroys the least recently parked entry on `device`. Returns false when there is none.
+  bool evict_parked(int device);
   void clear();
 
 private:
