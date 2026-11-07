@@ -17,7 +17,7 @@ import re
 import shutil
 import sys
 
-OUT = "/home/jcelerier/Documents/ossia/score/packages/user/presets/StreamDiffusion"
+OUT = "/home/jcelerier/Documents/ossia/score/packages/default/Presets/StreamDiffusion"
 UUID = "a202d577-f92e-4d47-b863-62be5c02084e"
 INDEX = "/media/data2/lrd-engines/index.json"
 
@@ -31,7 +31,7 @@ P = dict(workflow=4, prompt=5, negative=6, engines=7, seed=8, guidance=9, timest
 # Workflow enum (LibreDiffusion.hpp)
 (SD_T2I, SD_I2I, SD_T2I_CN, SD_I2I_CN, SD_T2I_IP, SD_I2I_IP, TURBO_T2I, TURBO_I2I,
  SDXL_T2I, SDXL_I2I, SDXL_T2I_CN, SDXL_I2I_CN, V2V_T2I, V2V_I2I,
- KLEIN_T2I, KLEIN_I2I, KLEIN_INPAINT, I2I_TURBO) = range(18)
+ KLEIN_T2I, KLEIN_I2I, KLEIN_INPAINT, I2I_TURBO, FLUX3_T2I, FLUX3_EDIT) = range(20)
 
 CFG_NONE, CFG_SELF, CFG_FULL, CFG_INIT = 0, 1, 2, 3
 
@@ -58,6 +58,7 @@ PROMPTS = {
     "ip": ("a portrait in the style of the reference image, highly detailed", "low quality, blurry"),
     "klein": ("turn this into a charcoal drawing", "blurry"),
     "i2it": ("a photo of a mountain landscape at golden hour", ""),
+    "flux3": ("a lighthouse on a rocky coast during a storm, crashing waves, photograph", ""),
 }
 
 
@@ -361,6 +362,18 @@ def build():
                  preset(f"FLUX2 Klein Sprint {steps}step img2img", KS, KLEIN_I2I, steps=1,
                         res=(320, 576), mode="i2i", timesteps=ts, prompt_key="klein",
                         klein_quality=1, rife_exp=2, is_async=True, check=False)]
+
+    # ---- FLUX.3-klein: Timesteps is a step count (or a list of times). Shape-dynamic engine, so
+    # any 16-multiple from 128 to 1024 works; 512 is the profile's opt. 1 step is soft; at 512 edits
+    # hold from 2 steps and 3 is close to 4. 320x576 is too small for FLUX.3 edits.
+    F3 = "/media/data1/flux3/engines"
+    for steps in (1, 2, 3, 4):
+        made += [preset(f"FLUX3 Klein {steps}step txt2img", F3, FLUX3_T2I, steps=1, res=(512, 512),
+                        mode="t2i", timesteps=str(steps), prompt_key="flux3", klein_quality=1,
+                        rife_exp=2, is_async=True, check=False),
+                 preset(f"FLUX3 Klein {steps}step edit", F3, FLUX3_EDIT, steps=1, res=(512, 512),
+                        mode="i2i", timesteps=str(steps), prompt_key="klein", klein_quality=1,
+                        rife_exp=2, is_async=True, check=False)]
 
     # ---- img2img-turbo (skip-VAE pix2pix-turbo): geometry and step count come from the engine.
     for name, eng in [("img2img-turbo edge2image", "/media/data1/img2img-turbo/bundle-traintest"),

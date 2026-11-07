@@ -52,7 +52,7 @@ struct SDConfigState
 };
 
 /**
- * @brief Real-time diffusion (SD1.5 / SD-turbo / SDXL / StreamV2V / FLUX.2-klein / img2img-turbo)
+ * @brief Real-time diffusion (SD1.5 / SD-turbo / SDXL / StreamV2V / FLUX.2-klein / FLUX.3-klein / img2img-turbo)
  * through the librediffusion C API, loaded at runtime.
  */
 struct StreamDiffusion
@@ -88,12 +88,16 @@ public:
     // github.com/GaParmar/img2img-turbo (pix2pix-turbo / CycleGAN-turbo skip-VAE): one-step image
     // translation from the input frame and a CLIP text embedding. Not a generic SD-turbo img2img.
     IMG2IMG_TURBO,
+    // FLUX.3-image-klein: text-to-image, or editing the "In" frame as a reference image, with
+    // "Control / Style" as an optional second reference ("the dog from the second image").
+    FLUX3_KLEIN_TXT2IMG,
+    FLUX3_KLEIN_EDIT,
   };
 
   enum KleinQuality : int8_t
   {
-    Quality, // transformer_bf16.plan
-    Speed    // transformer_fp8_calib.plan
+    Quality, // klein.2 transformer_bf16.plan, FLUX.3 transformer.plan
+    Speed    // klein.2 transformer_fp8_calib.plan, FLUX.3 transformer_fp8.plan
   };
 
   // How the render thread plays the producer's frames when Async is on: latency vs continuity.
@@ -118,7 +122,7 @@ public:
     // initialisers, so without it the texture fields are indeterminate until the host writes them.
     halp::texture_input<"In"> image{};
     // ControlNet control map (already preprocessed: canny/depth/pose/...), IP-Adapter style image,
-    // or the FLUX.2-klein inpaint mask (white = regenerate).
+    // the FLUX.2-klein inpaint mask (white = regenerate), or FLUX.3-klein's second reference.
     halp::texture_input<"Control / Style"> control{};
     // img2img-turbo only: an external CLIP text embedding [1,77,1024] = 78848 floats. When empty the
     // embedding is derived from the Prompt through the bundle's clip.engine.
@@ -209,7 +213,7 @@ public:
 
     struct : halp::enum_t<KleinQuality, "Klein quality">
     {
-      halp_meta(description, "FLUX.2-klein: bf16 (Quality) vs fp8 (Speed) transformer")
+      halp_meta(description, "FLUX.2/FLUX.3 klein: bf16 (Quality) vs fp8 (Speed) transformer")
       enum widget
       {
         combobox
@@ -287,6 +291,7 @@ private:
   {
     SD,     // SD1.5 / SD-turbo / SDXL / StreamV2V through the pipeline + CLIP + EngineCache
     Klein,  // FLUX.2-klein streaming pipeline
+    Flux3,  // FLUX.3-image-klein
     Turbo   // img2img-turbo skip-VAE pipeline
   };
   static Family familyOf(Workflow) noexcept;
@@ -340,6 +345,8 @@ private:
   bool updateScheduler(const std::string& timestep_str);
   bool configureKlein(const inputs_t& in);
   bool createKleinStream(const inputs_t& in);
+  bool configureFlux3(const inputs_t& in);
+  bool createFlux3(const inputs_t& in);
   bool configureTurbo(const inputs_t& in);
   // Drop the current family's pipelines, the RIFE handle and every frame in flight.
   void releaseFamily();
@@ -349,6 +356,8 @@ private:
   bool renderFrame(const AsyncJob& job, unsigned char* out_rgba);
   bool renderSD(const AsyncJob& job, unsigned char* out_rgba);
   bool renderKlein(const AsyncJob& job, unsigned char* out_rgba);
+  bool renderFlux3(const AsyncJob& job, unsigned char* out_rgba);
+  void flux3SecondReference(const inputs_t& in, AsyncJob& job);
   bool renderTurbo(const AsyncJob& job, unsigned char* out_rgba);
   void interpolate(const AsyncJob& job, AsyncFrame& out);
 
@@ -382,6 +391,15 @@ private:
   std::string m_klein_prompt;
   std::string m_klein_sched;
   uint64_t m_klein_mask_hash{0};
+
+  // FLUX.3-klein family
+  SDFlux3 m_flux3;
+  std::string m_flux3_prompt;
+  std::string m_flux3_sched;
+  int m_flux3_seed{0};
+  bool m_flux3_seeded{false};
+  int m_flux3_ref_budget{0}; // tokens all references may use together (engine profile)
+  bool m_reported_ref_budget{false};
 
   // img2img-turbo family
   SDImg2ImgTurbo m_i2it;
