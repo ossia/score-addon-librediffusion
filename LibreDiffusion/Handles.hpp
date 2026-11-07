@@ -90,6 +90,14 @@ struct SDFluxStream
       unsigned long long seed, int device);
 };
 
+struct SDFlux3 : handle_owner<librediffusion_flux3_handle, &sd::liblibrediffusion::flux3_destroy>
+{
+  SDFlux3() = default;
+  SDFlux3(
+      const char* transformer, const char* qwen, const char* vae_decoder, const char* vae_encoder,
+      const char* tokenizer_json, int device);
+};
+
 struct SDRife : handle_owner<librediffusion_rife_handle, &sd::liblibrediffusion::rife_destroy>
 {
   SDRife() = default;

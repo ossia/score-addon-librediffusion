@@ -264,6 +264,9 @@ StreamDiffusion::Family StreamDiffusion::familyOf(Workflow wf) noexcept
     case FLUX2_KLEIN_IMG2IMG:
     case FLUX2_KLEIN_INPAINT:
       return Family::Klein;
+    case FLUX3_KLEIN_TXT2IMG:
+    case FLUX3_KLEIN_EDIT:
+      return Family::Flux3;
     case IMG2IMG_TURBO:
       return Family::Turbo;
     default:
@@ -284,6 +287,7 @@ bool StreamDiffusion::isImg2Img(Workflow wf) noexcept
     case V2V_IMG2IMG:
     case FLUX2_KLEIN_IMG2IMG:
     case FLUX2_KLEIN_INPAINT:
+    case FLUX3_KLEIN_EDIT:
     case IMG2IMG_TURBO:
       return true;
     default:
@@ -452,6 +456,8 @@ bool StreamDiffusion::configure(const inputs_t& in)
       return configureSD(in);
     case Family::Klein:
       return configureKlein(in);
+    case Family::Flux3:
+      return configureFlux3(in);
     case Family::Turbo:
       return configureTurbo(in);
   }
@@ -545,6 +551,9 @@ bool StreamDiffusion::buildJob(const inputs_t& in, AsyncJob& job)
       return false;
     }
   }
+
+  if(wf == FLUX3_KLEIN_EDIT)
+    flux3SecondReference(in, job);
 
   job.controlnet_scale = in.controlnet_scale.value;
   job.ipadapter_scale = in.ipadapter_scale.value;
@@ -713,6 +722,11 @@ void StreamDiffusion::releaseFamily()
   m_klein_sched.clear();
   m_klein_mask_hash = 0;
 
+  m_flux3.reset();
+  m_flux3_prompt.clear();
+  m_flux3_sched.clear();
+  m_flux3_seeded = false;
+
   m_i2it.reset();
   m_i2it_clip.reset();
   m_i2it_embeddings.reset();
@@ -749,6 +763,8 @@ bool StreamDiffusion::renderFrame(const AsyncJob& job, unsigned char* out_rgba)
       return renderSD(job, out_rgba);
     case Family::Klein:
       return renderKlein(job, out_rgba);
+    case Family::Flux3:
+      return renderFlux3(job, out_rgba);
     case Family::Turbo:
       return renderTurbo(job, out_rgba);
   }
@@ -857,6 +873,71 @@ bool StreamDiffusion::renderKlein(const AsyncJob& job, unsigned char* out_rgba)
   const auto err = m_sd.flux2_stream_frame_cached(m_klein_stream.get(), out_rgba);
   if(err != LIBREDIFFUSION_SUCCESS)
     std::fprintf(stderr, "FLUX.2-klein: frame failed (%d)\n", (int)err);
+  return err == LIBREDIFFUSION_SUCCESS;
+}
+
+// "Control / Style" as FLUX.3's second reference: its own aspect ratio, the output's pixel count,
+// shrunk into whatever the engine's reference budget leaves after the first one.
+void StreamDiffusion::flux3SecondReference(const inputs_t& in, AsyncJob& job)
+{
+  const auto& c = in.control.texture;
+  if(!c.bytes || c.width <= 0 || c.height <= 0)
+    return;
+  const long left = (long)m_flux3_ref_budget - (long)(m_w / 16) * (m_h / 16);
+  const double area = std::min((double)m_w * m_h, (double)left * 256.);
+  const double k = std::sqrt(area / ((double)c.width * c.height));
+  const int rw = (int)(c.width * k) / 16 * 16, rh = (int)(c.height * k) / 16 * 16;
+  if(rw < 16 || rh < 16)
+  {
+    if(!m_reported_ref_budget)
+    {
+      m_reported_ref_budget = true;
+      std::fprintf(
+          stderr,
+          "FLUX.3-klein: no room for a second reference at %dx%d (engine budget %d tokens)\n", m_w,
+          m_h, m_flux3_ref_budget);
+    }
+    return;
+  }
+  m_reported_ref_budget = false;
+  rgba_image ref(c.bytes, c.width, c.height);
+  if(rw != c.width || rh != c.height)
+    ref = ref.scaled({rw, rh});
+  job.control_w = rw;
+  job.control_h = rh;
+  job.control_rgba = std::move(ref.px);
+  job.control_hash = hash_bytes(job.control_rgba.data(), job.control_rgba.size());
+}
+
+bool StreamDiffusion::renderFlux3(const AsyncJob& job, unsigned char* out_rgba)
+{
+  if(!m_flux3)
+    return false;
+  auto h = m_flux3.get();
+  if(!m_flux3_seeded || job.seed != m_flux3_seed)
+  {
+    m_sd.flux3_set_seed(h, (unsigned long long)(uint32_t)job.seed);
+    m_flux3_seed = job.seed;
+    m_flux3_seeded = true;
+  }
+  const uint64_t refs_hash = job.ref_hash ^ (job.control_hash * 0x9E3779B97F4A7C15ull);
+  if(refs_hash != m_applied_ref_hash)
+  {
+    m_applied_ref_hash = 0;
+    auto err = m_sd.flux3_set_reference(
+        h, job.ref_rgba.empty() ? nullptr : job.ref_rgba.data(), job.h, job.w);
+    if(err == LIBREDIFFUSION_SUCCESS && !job.ref_rgba.empty() && !job.control_rgba.empty())
+      err = m_sd.flux3_add_reference(h, job.control_rgba.data(), job.control_h, job.control_w);
+    if(err != LIBREDIFFUSION_SUCCESS)
+    {
+      std::fprintf(stderr, "FLUX.3-klein: setting the references failed (%d)\n", (int)err);
+      return false;
+    }
+    m_applied_ref_hash = refs_hash;
+  }
+  const auto err = m_sd.flux3_generate(h, job.h, job.w, out_rgba);
+  if(err != LIBREDIFFUSION_SUCCESS)
+    std::fprintf(stderr, "FLUX.3-klein: generate failed (%d)\n", (int)err);
   return err == LIBREDIFFUSION_SUCCESS;
 }
 
@@ -1377,6 +1458,98 @@ bool StreamDiffusion::updateScheduler(const std::string& timestep_str)
       return false;
     }
   }
+  return true;
+}
+
+// -------------------------------------------------------------------------------------------------
+// FLUX.3-klein configuration
+// -------------------------------------------------------------------------------------------------
+bool StreamDiffusion::configureFlux3(const inputs_t& in)
+{
+  int w = 0, h = 0;
+  if(!resolveResolution(in, 16, w, h))
+    return false;
+  if(in.prompt.value.empty())
+    return false;
+  if(!m_flux3 || m_model_dir != in.model.value || m_klein_quality != in.klein_quality.value)
+  {
+    if(!createFlux3(in))
+      return false;
+  }
+  if(m_w != w || m_h != h)
+  {
+    // the engines are shape-dynamic: only the frames in flight are stale
+    stopProducer();
+    m_w = w;
+    m_h = h;
+  }
+  auto h3 = m_flux3.get();
+
+  if(m_flux3_prompt != in.prompt.value)
+  {
+    stopProducer();
+    if(m_sd.flux3_set_prompt(h3, in.prompt.value.c_str()) < 0)
+    {
+      std::fprintf(stderr, "FLUX.3-klein: set_prompt failed\n");
+      return false;
+    }
+    m_flux3_prompt = in.prompt.value;
+  }
+
+  // Timesteps: a list of times in (0,1] (first = start noise level for edits), or a step count.
+  if(m_flux3_sched != in.t1.value)
+  {
+    stopProducer();
+    const auto times = get_sigmas(in.t1.value);
+    if(!times.empty())
+      m_sd.flux3_set_times(h3, times.data(), (int)times.size());
+    else
+    {
+      const int steps = std::atoi(in.t1.value.c_str());
+      m_sd.flux3_set_steps(h3, steps >= 1 && steps <= 64 ? steps : 4, 6.93f);
+    }
+    m_flux3_sched = in.t1.value;
+  }
+  return true;
+}
+
+bool StreamDiffusion::createFlux3(const inputs_t& in)
+{
+  const std::string& model = in.model.value;
+  std::array<float, 128> bn_mean{}, bn_std{};
+  if(!read_bn_file(model + "/bn_mean.bin", bn_mean) || !read_bn_file(model + "/bn_std.bin", bn_std))
+  {
+    std::fprintf(stderr, "FLUX.3-klein: %s lacks bn_mean.bin / bn_std.bin\n", model.c_str());
+    return false;
+  }
+  stopProducer();
+  m_flux3.reset();
+  // bundles exported without FP8 (pre-Ada builders) only carry the bf16 transformer
+  const std::string fp8 = model + "/transformer_fp8.plan";
+  const std::string transformer
+      = in.klein_quality.value == Speed && file_exists(fp8) ? fp8 : model + "/transformer.plan";
+  if(!create_evicting(m_device, [&] {
+       m_flux3 = SDFlux3{
+           transformer.c_str(), (model + "/qwen.plan").c_str(),
+           (model + "/vae_decoder.plan").c_str(), (model + "/vae_encoder.plan").c_str(),
+           (model + "/tokenizer.json").c_str(), m_device};
+       return bool(m_flux3);
+     }))
+  {
+    std::fprintf(stderr, "FLUX.3-klein: failed to load the engines from %s\n", model.c_str());
+    return false;
+  }
+  m_sd.flux3_set_bn(m_flux3.get(), bn_mean.data(), bn_std.data());
+  m_flux3_ref_budget = m_sd.flux3_max_reference_tokens(m_flux3.get());
+  m_model_dir = model;
+  m_klein_quality = in.klein_quality.value;
+  m_w = m_h = 0;
+  m_flux3_prompt.clear();
+  m_flux3_sched.clear();
+  m_flux3_seeded = false;
+  m_continuous = false; // fixed-seed noise: identical inputs, identical frame
+  m_rife.reset();
+  m_rife_failed_path.clear();
   return true;
 }
 

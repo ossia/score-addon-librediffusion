@@ -59,6 +59,13 @@ SDFluxStream::SDFluxStream(
 {
 }
 
+SDFlux3::SDFlux3(
+    const char* transformer, const char* qwen, const char* vae_decoder, const char* vae_encoder,
+    const char* tokenizer_json, int device)
+    : handle_owner{lib().flux3_create(transformer, qwen, vae_decoder, vae_encoder, tokenizer_json, device)}
+{
+}
+
 SDRife::SDRife(const char* engine_path, int device)
     : handle_owner{lib().rife_create(engine_path, device)}
 {
